@@ -50,6 +50,48 @@ All 7 RDF query patterns are supported, automatically selecting the optimal inde
 
 Three secondary indexes are created automatically: `idx_subject`, `idx_predicate`, `idx_object`.
 
+## Content Generator
+
+A standalone tool that reads JSON descriptor files and generates synthetic identity graph data at scale. Driven by two configuration files:
+
+- **`descriptors/contentTypes.json`** — defines 6 entity types (INDIVIDUAL, ACCOUNT, DISPLAY_DEVICE, ADDRESS, CREDIT_DEVICE, HOUSEHOLD), each with their own set of identifier properties and decay rates
+- **`descriptors/ontology.json`** — defines relationship rules between entity types (e.g., INDIVIDUAL → HAS_ONE_OR_MORE → ACCOUNT) with cardinality semantics
+
+### Running the Generator
+
+```bash
+go run ./cmd/generate/ \
+  -host 127.0.0.1 \
+  -port 3000 \
+  -namespace test \
+  -count 1000000 \
+  -batch 256 \
+  -workers 8
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-count` | `1000` | Number of INDIVIDUALs to generate |
+| `-batch` | `256` | Batch write size |
+| `-workers` | `8` | Concurrent writer goroutines |
+| `-content-types` | `descriptors/contentTypes.json` | Path to content types descriptor |
+| `-ontology` | `descriptors/ontology.json` | Path to ontology descriptor |
+| `-host` | `127.0.0.1` | Aerospike host |
+| `-port` | `3000` | Aerospike port |
+| `-namespace` | `test` | Aerospike namespace |
+
+### What It Generates
+
+Each INDIVIDUAL produces ~80 triples including:
+- **IS_TYPE** triple linking entity to its content type
+- **HAS_IDENTIFIER** triples for each property defined in contentTypes.json, with `created`, `last_seen`, and `decay` metadata
+- **Relationship triples** following ontology rules (HAS_ONE_OR_MORE, LIVES_AT, IS_PART_OF, etc.)
+- **Cross-linked entities**: shared identifiers (EMAIL_E, PHONE_E) create natural linkage between INDIVIDUALs and HOUSEHOLDs (~20% sharing rate)
+
+### Performance
+
+Benchmarked at ~300K triples/sec with 8 workers on a single Aerospike node.
+
 ## Interactive Graph Viewer
 
 A web-based property graph viewer built with Python, Dash, and Cytoscape. Connects directly to Aerospike and provides interactive visualization of RDF relationships.
@@ -95,7 +137,9 @@ store/reader.go      GetTriple, QueryBySubject/Predicate/Object, QuerySP/PO/SO, 
 graph/query.go       PatternQuery dispatcher for all 7 RDF patterns
 graph/traverse.go    BFS outbound/inbound traversal with depth limits
 ingest/loader.go     Batch and channel-based streaming ingestion
+cmd/generate/main.go Content generator driven by descriptor JSON files
 viewer/app.py        Interactive web-based graph viewer (Dash + Cytoscape)
+descriptors/         Content type and ontology JSON descriptors
 ```
 
 ## Example
