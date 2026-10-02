@@ -6,6 +6,7 @@ A high-performance RDF graph store in Go using Aerospike 8.2.0.0 as the key-valu
 
 - Go 1.25+
 - Aerospike Server 8.2.0.0+
+- Python 3.12+ (for the graph viewer)
 
 ## Usage
 
@@ -49,6 +50,40 @@ All 7 RDF query patterns are supported, automatically selecting the optimal inde
 
 Three secondary indexes are created automatically: `idx_subject`, `idx_predicate`, `idx_object`.
 
+## Interactive Graph Viewer
+
+A web-based property graph viewer built with Python, Dash, and Cytoscape. Connects directly to Aerospike and provides interactive visualization of RDF relationships.
+
+### Setup
+
+```bash
+pip install -r viewer/requirements.txt
+python viewer/app.py --host 127.0.0.1 --port 3000 --namespace test
+```
+
+Then open http://127.0.0.1:8050 in your browser.
+
+### Features
+
+- **Start Node** dropdown to select any node and begin exploring
+- **Max Hops** slider (1-6) to control traversal depth
+- **Predicate Filter** to show only specific relationship types
+- **Direction** control for outbound, inbound, or bidirectional traversal
+- **Multiple layouts**: cola (force-directed), dagre (hierarchical), breadthfirst, circle, concentric, grid
+- **Click** a node or edge to inspect all properties in the info panel
+- **Click** an unexpanded node to expand its relationships inline
+- **Graph stats** panel showing node/edge counts, predicates, and type breakdown
+- **Color-coded nodes** by type prefix (blue=user, green=post, orange=topic)
+
+### Viewer CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host` | `127.0.0.1` | Aerospike host |
+| `--port` | `3000` | Aerospike port |
+| `--namespace` | `test` | Aerospike namespace |
+| `--debug` | off | Enable Dash debug mode with hot reload |
+
 ## Package Structure
 
 ```
@@ -60,6 +95,7 @@ store/reader.go      GetTriple, QueryBySubject/Predicate/Object, QuerySP/PO/SO, 
 graph/query.go       PatternQuery dispatcher for all 7 RDF patterns
 graph/traverse.go    BFS outbound/inbound traversal with depth limits
 ingest/loader.go     Batch and channel-based streaming ingestion
+viewer/app.py        Interactive web-based graph viewer (Dash + Cytoscape)
 ```
 
 ## Example
