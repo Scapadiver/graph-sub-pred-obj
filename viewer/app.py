@@ -134,6 +134,12 @@ def bfs_expand(client, namespace, start_node, max_hops, predicates=None, directi
 # ---------------------------------------------------------------------------
 
 NODE_COLORS = {
+    "INDIVIDUAL": "#4FC3F7",
+    "ACCOUNT": "#81C784",
+    "HOUSEHOLD": "#FFB74D",
+    "ADDRESS": "#CE93D8",
+    "CREDIT_DEVICE": "#EF5350",
+    "DISPLAY_DEVICE": "#FFD54F",
     "user": "#4FC3F7",
     "post": "#81C784",
     "topic": "#FFB74D",
@@ -192,9 +198,6 @@ def build_elements(triples):
 def create_app(client, namespace):
     app = dash.Dash(__name__)
 
-    all_predicates = get_all_predicates(client, namespace)
-    all_nodes = get_all_nodes(client, namespace)
-
     cyto.load_extra_layouts()
 
     app.layout = html.Div([
@@ -214,11 +217,21 @@ def create_app(client, namespace):
             html.Div([
                 html.H4("Controls", style={"marginTop": "0"}),
 
+                html.Button("Refresh Data", id="refresh-btn", n_clicks=0,
+                             style={
+                                 "width": "100%", "padding": "8px",
+                                 "background": "#78909C", "color": "#fff",
+                                 "border": "none", "borderRadius": "4px",
+                                 "cursor": "pointer", "fontSize": "13px",
+                                 "marginBottom": "12px",
+                             }),
+                html.Div(id="refresh-status", style={"fontSize": "12px", "color": "#78909C", "marginBottom": "8px"}),
+
                 html.Label("Start Node"),
                 dcc.Dropdown(
                     id="start-node",
-                    options=[{"label": n, "value": n} for n in all_nodes],
-                    placeholder="Select or type a node...",
+                    options=[],
+                    placeholder="Click Refresh Data first...",
                     searchable=True,
                     style={"marginBottom": "12px"},
                 ),
@@ -233,7 +246,7 @@ def create_app(client, namespace):
                 html.Label("Predicate Filter", style={"marginTop": "12px"}),
                 dcc.Dropdown(
                     id="predicate-filter",
-                    options=[{"label": p, "value": p} for p in all_predicates],
+                    options=[],
                     multi=True,
                     placeholder="All predicates",
                     style={"marginBottom": "12px"},
@@ -380,6 +393,20 @@ def create_app(client, namespace):
     ], style={"fontFamily": "system-ui, sans-serif", "margin": "0"})
 
     # --- Callbacks ---
+
+    @app.callback(
+        [Output("start-node", "options"),
+         Output("predicate-filter", "options"),
+         Output("refresh-status", "children")],
+        Input("refresh-btn", "n_clicks"),
+    )
+    def refresh_dropdowns(n_clicks):
+        nodes = get_all_nodes(client, namespace)
+        predicates = get_all_predicates(client, namespace)
+        node_opts = [{"label": n, "value": n} for n in nodes]
+        pred_opts = [{"label": p, "value": p} for p in predicates]
+        status = f"Loaded {len(nodes)} nodes, {len(predicates)} predicates"
+        return node_opts, pred_opts, status
 
     @app.callback(
         Output("graph-data", "data"),
