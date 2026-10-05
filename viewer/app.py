@@ -17,6 +17,7 @@ import aerospike
 import dash
 from dash import html, dcc, callback_context
 from dash.dependencies import Input, Output, State
+from dash.exceptions import PreventUpdate
 import dash_cytoscape as cyto
 
 # ---------------------------------------------------------------------------
@@ -24,6 +25,19 @@ import dash_cytoscape as cyto
 # ---------------------------------------------------------------------------
 
 SETNAME = "triples"
+
+# Max node suggestions sent to the browser per search. The full node list can be
+# hundreds of thousands of entries, which freezes the page if sent as options.
+MAX_NODE_OPTIONS = 50
+MIN_SEARCH_CHARS = 2
+
+# Nodes with more edges than this (after predicate/direction filtering) are
+# hubs: shown with their degree but not expanded, so a shared node such as a
+# type doesn't pull thousands of neighbours into the graph. The start node is
+# always expanded.
+MAX_EXPAND_DEGREE = 10
+# Max edges listed per direction in the info panel.
+MAX_INFO_EDGES = 50
 
 
 def connect_aerospike(host, port, namespace):
@@ -102,7 +116,12 @@ def expand_node(client, namespace, node, predicates=None, direction="both"):
 
 
 def bfs_expand(client, namespace, start_node, max_hops, predicates=None, direction="both"):
-    """BFS traversal from start_node up to max_hops."""
+    """BFS traversal from start_node up to max_hops.
+
+    Returns (triples, hubs) where hubs maps each node that was not expanded
+    because its degree exceeds MAX_EXPAND_DEGREE to that degree.
+    """
+    hubs = {}
     visited_nodes = {start_node}
     visited_edges = set()
     all_triples = []
@@ -114,6 +133,9 @@ def bfs_expand(client, namespace, start_node, max_hops, predicates=None, directi
         next_level = []
         for node in current_level:
             triples = expand_node(client, namespace, node, predicates, direction)
+            if node != start_node and len(triples) > MAX_EXPAND_DEGREE:
+                hubs[node] = len(triples)
+                continue
             for t in triples:
                 s, p, o = t["subject"], t["predicate"], t["object"]
                 edge_key = (s, p, o)
@@ -126,7 +148,7 @@ def bfs_expand(client, namespace, start_node, max_hops, predicates=None, directi
                             next_level.append(n)
         current_level = next_level
 
-    return all_triples
+    return all_triples, hubs
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +253,7 @@ def create_app(client, namespace):
                 dcc.Dropdown(
                     id="start-node",
                     options=[],
-                    placeholder="Click Refresh Data first...",
+                    placeholder="Type to search nodes...",
                     searchable=True,
                     style={"marginBottom": "12px"},
                 ),
@@ -347,6 +369,17 @@ def create_app(client, namespace):
                                 "border-color": "#455A64",
                             },
                         },
+                        # Hub nodes (degree too high to expand)
+                        {
+                            "selector": ".hub",
+                            "style": {
+                                "border-style": "dashed",
+                                "border-width": "4px",
+                                "border-color": "#D84315",
+                                "width": "56px",
+                                "height": "56px",
+                            },
+                        },
                         # Expanded node highlight
                         {
                             "selector": "node:selected",
@@ -388,42 +421,62 @@ def create_app(client, namespace):
         ], style={"display": "flex", "height": "calc(100vh - 60px)"}),
 
         # Hidden stores
-        dcc.Store(id="graph-data", data={"elements": [], "expanded": []}),
+        dcc.Store(id="graph-data", data={"elements": [], "expanded": [], "hubs": {}}),
 
     ], style={"fontFamily": "system-ui, sans-serif", "margin": "0"})
 
     # --- Callbacks ---
 
+    # Node IDs are cached server-side; the dropdown is fed via search below.
+    node_cache = []
+
     @app.callback(
-        [Output("start-node", "options"),
-         Output("predicate-filter", "options"),
+        [Output("predicate-filter", "options"),
          Output("refresh-status", "children")],
         Input("refresh-btn", "n_clicks"),
     )
     def refresh_dropdowns(n_clicks):
-        nodes = get_all_nodes(client, namespace)
+        node_cache[:] = get_all_nodes(client, namespace)
         predicates = get_all_predicates(client, namespace)
-        node_opts = [{"label": n, "value": n} for n in nodes]
         pred_opts = [{"label": p, "value": p} for p in predicates]
-        status = f"Loaded {len(nodes)} nodes, {len(predicates)} predicates"
-        return node_opts, pred_opts, status
+        status = f"Loaded {len(node_cache)} nodes, {len(predicates)} predicates"
+        return pred_opts, status
+
+    @app.callback(
+        Output("start-node", "options"),
+        Input("start-node", "search_value"),
+        State("start-node", "value"),
+    )
+    def search_nodes(search, selected):
+        if not search or len(search) < MIN_SEARCH_CHARS:
+            if selected:
+                return [{"label": selected, "value": selected}]
+            raise PreventUpdate
+        needle = search.lower()
+        matches = []
+        for n in node_cache:
+            if needle in n.lower():
+                matches.append({"label": n, "value": n})
+                if len(matches) >= MAX_NODE_OPTIONS:
+                    break
+        return matches
 
     @app.callback(
         Output("graph-data", "data"),
         [Input("explore-btn", "n_clicks"),
          Input("clear-btn", "n_clicks"),
-         Input("graph", "tapNodeData")],
+         Input("graph", "tapNodeData"),
+         Input("max-hops", "value"),
+         Input("predicate-filter", "value"),
+         Input("direction", "value")],
         [State("start-node", "value"),
-         State("max-hops", "value"),
-         State("predicate-filter", "value"),
-         State("direction", "value"),
          State("graph-data", "data"),
          State("graph", "tapNode")],
         prevent_initial_call=True,
     )
     def update_graph_data(explore_clicks, clear_clicks, tap_data,
-                          start_node, max_hops, pred_filter, direction,
-                          current_data, tap_node):
+                          max_hops, pred_filter, direction,
+                          start_node, current_data, tap_node):
         ctx = callback_context
         if not ctx.triggered:
             return current_data
@@ -431,15 +484,22 @@ def create_app(client, namespace):
         trigger_id = ctx.triggered[0]["prop_id"].split(".")[0]
 
         if trigger_id == "clear-btn":
-            return {"elements": [], "expanded": []}
+            return {"elements": [], "expanded": [], "hubs": {}}
+
+        # Changing a query control rebuilds the current graph with the new
+        # settings; expanding with tap can only add edges, never remove them.
+        if trigger_id in ("max-hops", "predicate-filter", "direction"):
+            if not start_node or not current_data.get("elements"):
+                return current_data
+            trigger_id = "explore-btn"
 
         if trigger_id == "explore-btn":
             if not start_node:
                 return current_data
             preds = pred_filter if pred_filter else None
-            triples = bfs_expand(client, namespace, start_node, max_hops, preds, direction)
+            triples, hubs = bfs_expand(client, namespace, start_node, max_hops, preds, direction)
             elements = build_elements(triples)
-            return {"elements": elements, "expanded": [start_node]}
+            return {"elements": elements, "expanded": [start_node], "hubs": hubs}
 
         if trigger_id == "graph" and tap_data:
             # Double-click detection via tap - expand the node
@@ -452,6 +512,10 @@ def create_app(client, namespace):
             expanded.append(node_id)
             preds = pred_filter if pred_filter else None
             new_triples = expand_node(client, namespace, node_id, preds, direction)
+            hubs = current_data.get("hubs", {})
+            if node_id != start_node and len(new_triples) > MAX_EXPAND_DEGREE:
+                hubs[node_id] = len(new_triples)
+                return {**current_data, "expanded": expanded, "hubs": hubs}
             new_elements = build_elements(new_triples)
 
             existing = current_data.get("elements", [])
@@ -460,7 +524,7 @@ def create_app(client, namespace):
                 if el["data"]["id"] not in existing_ids:
                     existing.append(el)
 
-            return {"elements": existing, "expanded": expanded}
+            return {"elements": existing, "expanded": expanded, "hubs": hubs}
 
         return current_data
 
@@ -472,6 +536,18 @@ def create_app(client, namespace):
     )
     def render_graph(data, layout_name):
         elements = data.get("elements", []) if data else []
+        hubs = data.get("hubs", {}) if data else {}
+        if hubs:
+            decorated = []
+            for el in elements:
+                nid = el["data"]["id"]
+                if nid in hubs:
+                    el = {
+                        "data": {**el["data"], "label": f"{nid} ({hubs[nid]} edges)"},
+                        "classes": "hub",
+                    }
+                decorated.append(el)
+            elements = decorated
         layout = {"name": layout_name, "animate": True}
         if layout_name == "cola":
             layout["maxSimulationTime"] = 2000
@@ -500,16 +576,20 @@ def create_app(client, namespace):
 
             lines = [f"Node: {node_id}", f"Type: {node_type(node_id)}", ""]
             lines.append(f"Outbound edges: {len(outbound)}")
-            for t in outbound:
+            for t in outbound[:MAX_INFO_EDGES]:
                 props = t.get("props", {})
                 prop_str = f"  {json.dumps(props, default=str)}" if props else ""
                 lines.append(f"  -[{t['predicate']}]-> {t['object']}{prop_str}")
+            if len(outbound) > MAX_INFO_EDGES:
+                lines.append(f"  ... and {len(outbound) - MAX_INFO_EDGES} more")
 
             lines.append(f"\nInbound edges: {len(inbound)}")
-            for t in inbound:
+            for t in inbound[:MAX_INFO_EDGES]:
                 props = t.get("props", {})
                 prop_str = f"  {json.dumps(props, default=str)}" if props else ""
                 lines.append(f"  {t['subject']} -[{t['predicate']}]->{prop_str}")
+            if len(inbound) > MAX_INFO_EDGES:
+                lines.append(f"  ... and {len(inbound) - MAX_INFO_EDGES} more")
 
             return "\n".join(lines)
 
@@ -547,8 +627,15 @@ def create_app(client, namespace):
             html.Div(f"Edges: {len(edges)}"),
             html.Div(f"Predicates: {', '.join(sorted(predicates))}"),
             html.Div(f"Expanded: {len(data.get('expanded', []))} nodes"),
-            html.Hr(),
         ]
+        hubs = data.get("hubs", {})
+        if hubs:
+            lines.append(html.Div(f"Hubs not expanded (> {MAX_EXPAND_DEGREE} edges):",
+                                  style={"marginTop": "8px"}))
+            for nid, degree in sorted(hubs.items(), key=lambda h: -h[1]):
+                lines.append(html.Div(f"  {nid}: {degree} edges",
+                                      style={"color": "#D84315", "paddingLeft": "8px"}))
+        lines.append(html.Hr())
         for nt, count in sorted(node_types.items()):
             color = NODE_COLORS.get(nt, NODE_COLORS["default"])
             lines.append(html.Div([
