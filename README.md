@@ -107,15 +107,28 @@ Then open http://127.0.0.1:8050 in your browser.
 
 ### Features
 
-- **Start Node** dropdown to select any node and begin exploring
+- **Start Node** search: type 2+ characters to find a node (up to 50 matches are shown, so large graphs don't overload the browser)
 - **Max Hops** slider (1-6) to control traversal depth
 - **Predicate Filter** to show only specific relationship types
 - **Direction** control for outbound, inbound, or bidirectional traversal
+- Changing Max Hops, Predicate Filter, or Direction rebuilds the current graph immediately
 - **Multiple layouts**: cola (force-directed), dagre (hierarchical), breadthfirst, circle, concentric, grid
-- **Click** a node or edge to inspect all properties in the info panel
+- **Click** a node or edge to inspect all properties in the info panel (up to 50 edges listed per direction)
 - **Click** an unexpanded node to expand its relationships inline
-- **Graph stats** panel showing node/edge counts, predicates, and type breakdown
+- **Graph stats** panel showing node/edge counts, predicates, type breakdown, and hubs
 - **Color-coded nodes** by type prefix (blue=user, green=post, orange=topic)
+
+### Hub Limit
+
+Nodes with more than 10 edges are treated as **hubs** and are not expanded, so a shared node doesn't pull thousands of neighbors into the graph. For example, every entity links to its bare type node (`INDIVIDUAL`, `ACCOUNT`, ...) through `IS_TYPE`.
+
+- Hubs still appear in the graph, labeled with their edge count (e.g. `INDIVIDUAL (12038 edges)`) and drawn with a dashed orange border
+- Graph Stats lists the hubs that were not expanded, largest first
+- Clicking a hub does not expand it
+- The start node is always expanded, whatever its degree
+- Degree is counted after the predicate filter and direction are applied, so a node can be a hub under one filter and expandable under another
+
+Change the threshold with `MAX_EXPAND_DEGREE` at the top of `viewer/app.py`.
 
 ### Viewer CLI Flags
 
