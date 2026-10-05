@@ -7,6 +7,8 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"regexp"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,6 +41,18 @@ type OntologyFile struct {
 	Ontology []OntologyRelation `json:"ontology"`
 }
 
+// Cardinality caps how many entities of LinkedTo type may link to one entity
+// of Type, e.g. one ACCOUNT is shared by at most 4 INDIVIDUALs.
+type Cardinality struct {
+	Type     string `json:"TYPE"`
+	LinkedTo string `json:"LINKED_TO"`
+	Max      int    `json:"MAX"`
+}
+
+type CardinalitiesFile struct {
+	Cardinalities []Cardinality `json:"cardinalities"`
+}
+
 // ---------------------------------------------------------------------------
 // Cardinality rules derived from ontology predicates
 // ---------------------------------------------------------------------------
@@ -65,6 +79,34 @@ var idCounter atomic.Int64
 
 func nextID() int64 {
 	return idCounter.Add(1)
+}
+
+// Counter values embedded in entity IDs ("ACCOUNT:123") and identifier values
+// ("EMAIL_E:EMAIL_E_123_abc"), used to resume numbering above existing data.
+var (
+	entityIDPattern     = regexp.MustCompile(`^[A-Z_]+:(\d+)$`)
+	identifierIDPattern = regexp.MustCompile(`_(\d+)_[0-9a-f]+$`)
+)
+
+func idCounterValue(id string) int64 {
+	m := entityIDPattern.FindStringSubmatch(id)
+	if m == nil {
+		m = identifierIDPattern.FindStringSubmatch(id)
+	}
+	if m == nil {
+		return 0
+	}
+	n, _ := strconv.ParseInt(m[1], 10, 64)
+	return n
+}
+
+func entityType(id string) string {
+	for i := 0; i < len(id); i++ {
+		if id[i] == ':' {
+			return id[:i]
+		}
+	}
+	return ""
 }
 
 func generateEntityID(contentType string) string {
@@ -117,6 +159,122 @@ func generateEntityTriples(entityID string, contentType string, propDefs map[str
 }
 
 // ---------------------------------------------------------------------------
+// Entity sharing
+// ---------------------------------------------------------------------------
+
+// maxPoolPerType bounds memory; once full, new entities replace random slots.
+const maxPoolPerType = 100000
+
+// sharePool holds entities that individuals may link to instead of creating a
+// new one. Sharing is expressed only by triples reusing the same entity ID, so
+// relations form naturally when the RDF is loaded. An entity leaves the pool
+// once it reaches its cardinality cap.
+type sharePool struct {
+	mu     sync.Mutex
+	rate   float64
+	caps   map[string]int      // entity type -> max INDIVIDUALs per entity
+	avail  map[string][]string // entity type -> IDs below cap
+	counts map[string]int      // entity ID -> INDIVIDUALs linked
+}
+
+func newSharePool(rate float64, cards []Cardinality) *sharePool {
+	p := &sharePool{
+		rate:   rate,
+		caps:   make(map[string]int),
+		avail:  make(map[string][]string),
+		counts: make(map[string]int),
+	}
+	for _, c := range cards {
+		if c.LinkedTo != "INDIVIDUAL" {
+			log.Printf("cardinality %s -> %s ignored: only INDIVIDUAL links are supported", c.Type, c.LinkedTo)
+			continue
+		}
+		p.caps[c.Type] = c.Max
+	}
+	return p
+}
+
+// add offers an entity already linked to count individuals for sharing.
+func (p *sharePool) add(entityType, id string, count int, rng *rand.Rand) {
+	if count >= p.caps[entityType] {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	list := p.avail[entityType]
+	if len(list) < maxPoolPerType {
+		p.avail[entityType] = append(list, id)
+	} else {
+		i := rng.Intn(len(list))
+		delete(p.counts, list[i])
+		list[i] = id
+	}
+	p.counts[id] = count
+}
+
+// pick returns, with probability rate, an existing entity of entityType that
+// is below its cap and not in exclude, recording the new link.
+func (p *sharePool) pick(entityType string, exclude map[string]bool, rng *rand.Rand) (string, bool) {
+	if p.caps[entityType] < 2 || rng.Float64() >= p.rate {
+		return "", false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	list := p.avail[entityType]
+	for attempt := 0; attempt < 3 && len(list) > 0; attempt++ {
+		i := rng.Intn(len(list))
+		id := list[i]
+		if exclude[id] {
+			continue
+		}
+		p.counts[id]++
+		if p.counts[id] >= p.caps[entityType] {
+			list[i] = list[len(list)-1]
+			p.avail[entityType] = list[:len(list)-1]
+			delete(p.counts, id)
+		}
+		return id, true
+	}
+	return "", false
+}
+
+// loadExisting scans the store once to resume ID numbering above existing data
+// and to seed the share pools with existing entities, so new content links
+// into the graph already loaded.
+func loadExisting(gs *store.GraphStore, pool *sharePool, sharedHouseholds map[string]string, rng *rand.Rand) (int, error) {
+	var maxID int64
+	var scanned int
+	individualLinks := make(map[string]int)
+
+	err := gs.ScanEach(func(t *model.Triple) error {
+		scanned++
+		for _, id := range []string{t.Subject, t.Object} {
+			if n := idCounterValue(id); n > maxID {
+				maxID = n
+			}
+		}
+		if entityType(t.Subject) == "INDIVIDUAL" {
+			if _, ok := pool.caps[entityType(t.Object)]; ok {
+				individualLinks[t.Object]++
+			}
+		}
+		if t.Predicate == "IS_TYPE" && t.Object == "HOUSEHOLD" && len(sharedHouseholds) < maxPoolPerType {
+			sharedHouseholds[t.Subject] = t.Subject
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	idCounter.Store(maxID)
+	for id, count := range individualLinks {
+		pool.add(entityType(id), id, count, rng)
+	}
+	return scanned, nil
+}
+
+// ---------------------------------------------------------------------------
 // Graph generation
 // ---------------------------------------------------------------------------
 
@@ -134,6 +292,7 @@ func generateIndividualGraph(
 	rng *rand.Rand,
 	sharedHouseholds map[string]string, // email -> householdID for cross-linking
 	mu *sync.Mutex,
+	pool *sharePool,
 ) *generatedGraph {
 
 	g := &generatedGraph{
@@ -145,10 +304,14 @@ func generateIndividualGraph(
 	g.triples = append(g.triples, generateEntityTriples(individualID, "INDIVIDUAL", indProps, now)...)
 	g.entities["INDIVIDUAL"] = []string{individualID}
 
-	// Track generated entities for relationship wiring
+	// Entities linked to this individual (new or shared), for relationship wiring
 	generated := map[string][]string{
 		"INDIVIDUAL": {individualID},
 	}
+	// Entities created by this individual. Only these get their own outgoing
+	// relations; shared entities already have theirs.
+	created := map[string][]string{}
+	linked := map[string]bool{}
 
 	// Process ontology rules originating from INDIVIDUAL
 	for _, rel := range ontology {
@@ -170,14 +333,12 @@ func generateIndividualGraph(
 			if householdID == "" {
 				householdID = generateEntityID("HOUSEHOLD")
 				registerHouseholdEmails(householdID, indProps, sharedHouseholds, mu)
-			}
-
-			if _, exists := generated["HOUSEHOLD"]; !exists {
 				if hhProps, ok := contentTypes["HOUSEHOLD"]; ok {
 					g.triples = append(g.triples, generateEntityTriples(householdID, "HOUSEHOLD", hhProps, now)...)
 				}
-				generated["HOUSEHOLD"] = []string{householdID}
+				created["HOUSEHOLD"] = []string{householdID}
 			}
+			generated["HOUSEHOLD"] = []string{householdID}
 
 			g.triples = append(g.triples, &model.Triple{
 				Subject:   individualID,
@@ -192,13 +353,18 @@ func generateIndividualGraph(
 		}
 
 		for i := 0; i < count; i++ {
-			objID := generateEntityID(objType)
-
-			// Generate the related entity
-			if objProps, ok := contentTypes[objType]; ok {
-				g.triples = append(g.triples, generateEntityTriples(objID, objType, objProps, now)...)
+			// Link to an existing entity when sharing, otherwise create one
+			objID, shared := pool.pick(objType, linked, rng)
+			if !shared {
+				objID = generateEntityID(objType)
+				if objProps, ok := contentTypes[objType]; ok {
+					g.triples = append(g.triples, generateEntityTriples(objID, objType, objProps, now)...)
+				}
+				created[objType] = append(created[objType], objID)
+				pool.add(objType, objID, 1, rng)
 			}
 
+			linked[objID] = true
 			generated[objType] = append(generated[objType], objID)
 
 			// Create the relationship triple
@@ -220,7 +386,7 @@ func generateIndividualGraph(
 			continue
 		}
 
-		subjects, ok := generated[rel.Sub]
+		subjects, ok := created[rel.Sub]
 		if !ok {
 			continue
 		}
@@ -269,7 +435,7 @@ func generateIndividualGraph(
 			continue
 		}
 
-		subjects, ok := generated["HOUSEHOLD"]
+		subjects, ok := created["HOUSEHOLD"]
 		if !ok {
 			continue
 		}
@@ -348,6 +514,8 @@ func main() {
 	workers := flag.Int("workers", 8, "Number of concurrent writer goroutines")
 	contentTypesPath := flag.String("content-types", "descriptors/contentTypes.json", "Path to contentTypes.json")
 	ontologyPath := flag.String("ontology", "descriptors/ontology.json", "Path to ontology.json")
+	cardinalitiesPath := flag.String("cardinalities", "descriptors/cardinalities.json", "Path to cardinalities.json")
+	shareRate := flag.Float64("share-rate", 0.2, "Probability an individual links to an existing entity instead of a new one")
 	flag.Parse()
 
 	// Load descriptors
@@ -369,7 +537,17 @@ func main() {
 		log.Fatalf("failed to parse ontology: %v", err)
 	}
 
-	fmt.Printf("Loaded %d content types, %d ontology relations\n", len(ctFile.ContentTypes), len(ontFile.Ontology))
+	cardData, err := os.ReadFile(*cardinalitiesPath)
+	if err != nil {
+		log.Fatalf("failed to read cardinalities: %v", err)
+	}
+	var cardFile CardinalitiesFile
+	if err := json.Unmarshal(cardData, &cardFile); err != nil {
+		log.Fatalf("failed to parse cardinalities: %v", err)
+	}
+
+	fmt.Printf("Loaded %d content types, %d ontology relations, %d cardinalities\n",
+		len(ctFile.ContentTypes), len(ontFile.Ontology), len(cardFile.Cardinalities))
 	for ct, props := range ctFile.ContentTypes {
 		fmt.Printf("  %-20s %d identifiers\n", ct, len(props))
 	}
@@ -385,6 +563,19 @@ func main() {
 	if err := gs.CreateIndexes(); err != nil {
 		log.Fatalf("failed to create indexes: %v", err)
 	}
+
+	pool := newSharePool(*shareRate, cardFile.Cardinalities)
+	sharedHouseholds := make(map[string]string)
+	fmt.Println("Scanning existing graph for shareable entities...")
+	scanned, err := loadExisting(gs, pool, sharedHouseholds, rand.New(rand.NewSource(rand.Int63())))
+	if err != nil {
+		log.Fatalf("failed to scan existing graph: %v", err)
+	}
+	fmt.Printf("  %d existing triples, IDs resume at %d, %d households\n", scanned, idCounter.Load()+1, len(sharedHouseholds))
+	for _, c := range cardFile.Cardinalities {
+		fmt.Printf("  %-20s max %d %s, %d shareable\n", c.Type, c.Max, c.LinkedTo, len(pool.avail[c.Type]))
+	}
+	fmt.Println()
 
 	fmt.Printf("Generating %d individuals with full entity graphs...\n", *count)
 
@@ -445,7 +636,6 @@ func main() {
 	// Generator goroutines
 	var genWg sync.WaitGroup
 	genCh := make(chan int, *workers*2)
-	sharedHouseholds := make(map[string]string)
 	var hhMu sync.Mutex
 	now := time.Now().UnixMilli()
 
@@ -456,7 +646,7 @@ func main() {
 			rng := rand.New(rand.NewSource(seed))
 			for range genCh {
 				indID := generateEntityID("INDIVIDUAL")
-				g := generateIndividualGraph(indID, ctFile.ContentTypes, ontFile.Ontology, now, rng, sharedHouseholds, &hhMu)
+				g := generateIndividualGraph(indID, ctFile.ContentTypes, ontFile.Ontology, now, rng, sharedHouseholds, &hhMu, pool)
 				tripleCh <- g.triples
 			}
 		}(rand.Int63())

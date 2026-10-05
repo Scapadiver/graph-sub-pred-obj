@@ -115,6 +115,27 @@ func (gs *GraphStore) ScanAll() ([]*model.Triple, error) {
 	return results, nil
 }
 
+// ScanEach streams every triple's subject, predicate and object (no props) to fn
+// without holding the whole set in memory. Scanning stops at the first error.
+func (gs *GraphStore) ScanEach(fn func(*model.Triple) error) error {
+	sp := aero.NewScanPolicy()
+	rs, err := gs.Client.ScanAll(sp, gs.Namespace, SetName, "subject", "predicate", "object")
+	if err != nil {
+		return err
+	}
+	defer rs.Close()
+
+	for r := range rs.Results() {
+		if r.Err != nil {
+			return r.Err
+		}
+		if err := fn(recordToTriple(r.Record)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func recordToTriple(rec *aero.Record) *model.Triple {
 	t := &model.Triple{}
 

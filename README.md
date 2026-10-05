@@ -52,10 +52,11 @@ Three secondary indexes are created automatically: `idx_subject`, `idx_predicate
 
 ## Content Generator
 
-A standalone tool that reads JSON descriptor files and generates synthetic identity graph data at scale. Driven by two configuration files:
+A standalone tool that reads JSON descriptor files and generates synthetic identity graph data at scale. Driven by three configuration files:
 
 - **`descriptors/contentTypes.json`** — defines 6 entity types (INDIVIDUAL, ACCOUNT, DISPLAY_DEVICE, ADDRESS, CREDIT_DEVICE, HOUSEHOLD), each with their own set of identifier properties and decay rates
 - **`descriptors/ontology.json`** — defines relationship rules between entity types (e.g., INDIVIDUAL → HAS_ONE_OR_MORE → ACCOUNT) with cardinality semantics
+- **`descriptors/cardinalities.json`** — caps how many INDIVIDUALs may share one entity (e.g., an ACCOUNT is shared by at most 4 INDIVIDUALs, an ADDRESS by at most 2)
 
 ### Running the Generator
 
@@ -76,6 +77,8 @@ go run ./cmd/generate/ \
 | `-workers` | `8` | Concurrent writer goroutines |
 | `-content-types` | `descriptors/contentTypes.json` | Path to content types descriptor |
 | `-ontology` | `descriptors/ontology.json` | Path to ontology descriptor |
+| `-cardinalities` | `descriptors/cardinalities.json` | Path to cardinalities descriptor |
+| `-share-rate` | `0.2` | Probability an INDIVIDUAL links to an existing entity instead of creating a new one |
 | `-host` | `127.0.0.1` | Aerospike host |
 | `-port` | `3000` | Aerospike port |
 | `-namespace` | `test` | Aerospike namespace |
@@ -86,7 +89,33 @@ Each INDIVIDUAL produces ~80 triples including:
 - **IS_TYPE** triple linking entity to its content type
 - **HAS_IDENTIFIER** triples for each property defined in contentTypes.json, with `created`, `last_seen`, and `decay` metadata
 - **Relationship triples** following ontology rules (HAS_ONE_OR_MORE, LIVES_AT, IS_PART_OF, etc.)
-- **Cross-linked entities**: shared identifiers (EMAIL_E, PHONE_E) create natural linkage between INDIVIDUALs and HOUSEHOLDs (~20% sharing rate)
+- **Shared entities**: ~20% of INDIVIDUAL links to an ACCOUNT, ADDRESS, CREDIT_DEVICE, or DISPLAY_DEVICE reuse an existing entity (up to its cardinality cap), and ~20% of INDIVIDUALs join an existing HOUSEHOLD
+
+### Sharing and Incremental Runs
+
+Sharing is expressed purely as triples that reuse an existing entity's ID, so relations form naturally when the RDF content is loaded. A shared entity is linked to, but its own identifier, type, and outgoing relationship triples are not generated again.
+
+Before generating, the tool scans the existing `triples` set once to:
+- **Resume ID numbering** above the highest ID already stored, so repeated runs never collide with earlier data
+- **Seed the share pools** with existing entities and how many INDIVIDUALs already link to each, so new content links into the existing graph without exceeding the caps
+
+Entities that reach their cap leave the pool. Each pool holds up to 100,000 entities per type. Two generator runs writing at the same time can still collide, so run them one at a time.
+
+#### cardinalities.json
+
+```json
+{
+	"cardinalities":
+		[
+			{"TYPE": "ACCOUNT",        "LINKED_TO": "INDIVIDUAL", "MAX": 4},
+			{"TYPE": "ADDRESS",        "LINKED_TO": "INDIVIDUAL", "MAX": 2},
+			{"TYPE": "CREDIT_DEVICE",  "LINKED_TO": "INDIVIDUAL", "MAX": 4},
+			{"TYPE": "DISPLAY_DEVICE", "LINKED_TO": "INDIVIDUAL", "MAX": 6}
+		]
+}
+```
+
+Types without an entry are never shared. Only `LINKED_TO: "INDIVIDUAL"` is supported; other entries are ignored with a warning.
 
 ### Performance
 
