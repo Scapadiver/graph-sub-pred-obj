@@ -1,3 +1,4 @@
 .idea/
 /generate
 __pycache__/
+/graph-spo
