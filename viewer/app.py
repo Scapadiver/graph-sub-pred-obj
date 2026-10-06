@@ -13,8 +13,10 @@ import argparse
 import hashlib
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import aerospike
+from aerospike_helpers import expressions as exp
 import dash
 from dash import html, dcc, callback_context
 from dash.dependencies import Input, Output, State
@@ -39,6 +41,14 @@ MIN_SEARCH_CHARS = 2
 MAX_EXPAND_DEGREE = 10
 # Max edges listed per direction in the info panel.
 MAX_INFO_EDGES = 50
+# Max edges fetched per direction for one node. Hub degrees above this are
+# shown as "1000+" instead of fetching every edge just to count them.
+HUB_COUNT_CAP = 1000
+# Concurrent queries per BFS level; hides round-trip latency to remote clusters.
+QUERY_THREADS = 16
+# Triples sampled for node search and the predicate list, instead of scanning
+# the whole set. Any full node ID can still be found by typing it exactly.
+DEFAULT_SAMPLE_SIZE = 100000
 
 
 def parse_hosts(hosts, default_port, tls_name=None):
@@ -84,70 +94,72 @@ def triple_key(s, p, o):
     return h.hexdigest()
 
 
-def query_by_bin(client, namespace, bin_name, value):
-    """Secondary index query on a single bin."""
+def predicate_filter(predicates):
+    """Server-side filter keeping only triples with one of the predicates."""
+    if not predicates:
+        return None
+    terms = [exp.Eq(exp.StrBin("predicate"), p) for p in predicates]
+    return (terms[0] if len(terms) == 1 else exp.Or(*terms)).compile()
+
+
+def query_by_bin(client, namespace, bin_name, value, predicates=None, limit=None):
+    """Secondary index query on a single bin, optionally filtered by predicate
+    on the server and capped at limit records."""
     query = client.query(namespace, SETNAME)
     query.where(aerospike.predicates.equals(bin_name, value))
-    results = []
-    for _, _, bins in query.results():
-        results.append(bins)
-    return results
+    if limit:
+        query.max_records = limit
+    policy = {}
+    flt = predicate_filter(predicates)
+    if flt is not None:
+        policy["expressions"] = flt
+    return [bins for _, _, bins in query.results(policy=policy)]
 
 
-def query_sp(client, namespace, subject, predicate):
-    """SP? pattern: subject + predicate filter."""
-    triples = query_by_bin(client, namespace, "subject", subject)
-    return [t for t in triples if t.get("predicate") == predicate]
-
-
-def query_po(client, namespace, predicate, obj):
-    """?PO pattern: predicate + object filter."""
-    triples = query_by_bin(client, namespace, "predicate", predicate)
-    return [t for t in triples if t.get("object") == obj]
-
-
-def get_all_predicates(client, namespace):
-    """Scan to discover all unique predicates."""
+def sample_graph(client, namespace, sample_size):
+    """Scan up to sample_size triples for node IDs and predicates."""
     scan = client.scan(namespace, SETNAME)
-    scan.select("predicate")
-    predicates = set()
-    for _, _, bins in scan.results():
-        predicates.add(bins.get("predicate", ""))
-    return sorted(predicates)
-
-
-def get_all_nodes(client, namespace):
-    """Scan to discover all unique subjects and objects."""
-    scan = client.scan(namespace, SETNAME)
-    scan.select("subject", "object")
-    nodes = set()
-    for _, _, bins in scan.results():
+    scan.select("subject", "predicate", "object")
+    nodes, predicates = set(), set()
+    for _, _, bins in scan.results(policy={"max_records": sample_size}):
         nodes.add(bins.get("subject", ""))
         nodes.add(bins.get("object", ""))
-    return sorted(nodes)
+        predicates.add(bins.get("predicate", ""))
+    nodes.discard("")
+    predicates.discard("")
+    return sorted(nodes), sorted(predicates)
 
 
-def expand_node(client, namespace, node, predicates=None, direction="both"):
-    """Get all triples connected to a node, optionally filtered by predicates and direction."""
-    triples = []
-    if direction in ("both", "outbound"):
-        outbound = query_by_bin(client, namespace, "subject", node)
-        triples.extend(outbound)
-    if direction in ("both", "inbound"):
-        inbound = query_by_bin(client, namespace, "object", node)
-        triples.extend(inbound)
+def node_exists(client, namespace, node):
+    """Whether any triple has node as its subject or object."""
+    return any(query_by_bin(client, namespace, b, node, limit=1) for b in ("subject", "object"))
 
-    if predicates:
-        triples = [t for t in triples if t.get("predicate") in predicates]
 
-    return triples
+def expand_node(client, namespace, node, predicates=None, direction="both", limit=HUB_COUNT_CAP):
+    """Get triples connected to a node, filtered by predicates and direction.
+
+    Returns (triples, truncated): at most limit triples per direction, and
+    whether either direction hit the limit.
+    """
+    triples, truncated = [], False
+    bins = {"both": ("subject", "object"), "outbound": ("subject",), "inbound": ("object",)}[direction]
+    for b in bins:
+        found = query_by_bin(client, namespace, b, node, predicates, limit)
+        truncated |= len(found) >= limit
+        triples.extend(found)
+    return triples, truncated
+
+
+def degree_label(triples, truncated):
+    return f"{len(triples)}+" if truncated else str(len(triples))
 
 
 def bfs_expand(client, namespace, start_node, max_hops, predicates=None, direction="both"):
     """BFS traversal from start_node up to max_hops.
 
     Returns (triples, hubs) where hubs maps each node that was not expanded
-    because its degree exceeds MAX_EXPAND_DEGREE to that degree.
+    because its degree exceeds MAX_EXPAND_DEGREE to its degree label. Each
+    level's nodes are queried concurrently.
     """
     hubs = {}
     visited_nodes = {start_node}
@@ -155,26 +167,28 @@ def bfs_expand(client, namespace, start_node, max_hops, predicates=None, directi
     all_triples = []
     current_level = [start_node]
 
-    for _ in range(max_hops):
-        if not current_level:
-            break
-        next_level = []
-        for node in current_level:
-            triples = expand_node(client, namespace, node, predicates, direction)
-            if node != start_node and len(triples) > MAX_EXPAND_DEGREE:
-                hubs[node] = len(triples)
-                continue
-            for t in triples:
-                s, p, o = t["subject"], t["predicate"], t["object"]
-                edge_key = (s, p, o)
-                if edge_key not in visited_edges:
-                    visited_edges.add(edge_key)
-                    all_triples.append(t)
-                    for n in (s, o):
-                        if n not in visited_nodes:
-                            visited_nodes.add(n)
-                            next_level.append(n)
-        current_level = next_level
+    with ThreadPoolExecutor(QUERY_THREADS) as pool:
+        for _ in range(max_hops):
+            if not current_level:
+                break
+            results = pool.map(
+                lambda n: expand_node(client, namespace, n, predicates, direction), current_level)
+            next_level = []
+            for node, (triples, truncated) in zip(current_level, results):
+                if node != start_node and len(triples) > MAX_EXPAND_DEGREE:
+                    hubs[node] = degree_label(triples, truncated)
+                    continue
+                for t in triples:
+                    s, p, o = t["subject"], t["predicate"], t["object"]
+                    edge_key = (s, p, o)
+                    if edge_key not in visited_edges:
+                        visited_edges.add(edge_key)
+                        all_triples.append(t)
+                        for n in (s, o):
+                            if n not in visited_nodes:
+                                visited_nodes.add(n)
+                                next_level.append(n)
+            current_level = next_level
 
     return all_triples, hubs
 
@@ -245,7 +259,7 @@ def build_elements(triples):
 # Dash app
 # ---------------------------------------------------------------------------
 
-def create_app(client, namespace):
+def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE):
     app = dash.Dash(__name__)
 
     cyto.load_extra_layouts()
@@ -455,19 +469,22 @@ def create_app(client, namespace):
 
     # --- Callbacks ---
 
-    # Node IDs are cached server-side; the dropdown is fed via search below.
+    # Sampled node IDs are cached server-side; the dropdown is fed via search below.
     node_cache = []
 
     @app.callback(
         [Output("predicate-filter", "options"),
          Output("refresh-status", "children")],
         Input("refresh-btn", "n_clicks"),
+        running=[(Output("refresh-btn", "disabled"), True, False),
+                 (Output("refresh-status", "children"), f"Sampling up to {sample_size:,} triples...", "")],
     )
     def refresh_dropdowns(n_clicks):
-        node_cache[:] = get_all_nodes(client, namespace)
-        predicates = get_all_predicates(client, namespace)
+        nodes, predicates = sample_graph(client, namespace, sample_size)
+        node_cache[:] = nodes
         pred_opts = [{"label": p, "value": p} for p in predicates]
-        status = f"Loaded {len(node_cache)} nodes, {len(predicates)} predicates"
+        status = (f"Sampled {len(nodes):,} nodes, {len(predicates)} predicates. "
+                  "Type a full node ID to find any node.")
         return pred_opts, status
 
     @app.callback(
@@ -487,6 +504,10 @@ def create_app(client, namespace):
                 matches.append({"label": n, "value": n})
                 if len(matches) >= MAX_NODE_OPTIONS:
                     break
+        # Nodes outside the sample are found by exact ID
+        exact = search.strip()
+        if all(m["value"] != exact for m in matches) and node_exists(client, namespace, exact):
+            matches.insert(0, {"label": exact, "value": exact})
         return matches
 
     @app.callback(
@@ -539,10 +560,10 @@ def create_app(client, namespace):
 
             expanded.append(node_id)
             preds = pred_filter if pred_filter else None
-            new_triples = expand_node(client, namespace, node_id, preds, direction)
+            new_triples, truncated = expand_node(client, namespace, node_id, preds, direction)
             hubs = current_data.get("hubs", {})
             if node_id != start_node and len(new_triples) > MAX_EXPAND_DEGREE:
-                hubs[node_id] = len(new_triples)
+                hubs[node_id] = degree_label(new_triples, truncated)
                 return {**current_data, "expanded": expanded, "hubs": hubs}
             new_elements = build_elements(new_triples)
 
@@ -598,26 +619,28 @@ def create_app(client, namespace):
 
         if "tapNodeData" in trigger and node_data:
             node_id = node_data["id"]
-            # Fetch all triples for this node to show properties
-            outbound = query_by_bin(client, namespace, "subject", node_id)
-            inbound = query_by_bin(client, namespace, "object", node_id)
+            # Fetch this node's triples, capped so hubs stay cheap to inspect
+            outbound = query_by_bin(client, namespace, "subject", node_id, limit=HUB_COUNT_CAP)
+            inbound = query_by_bin(client, namespace, "object", node_id, limit=HUB_COUNT_CAP)
+            def count(ts, skip=0):
+                return f"{len(ts) - skip}" + ("+" if len(ts) >= HUB_COUNT_CAP else "")
 
             lines = [f"Node: {node_id}", f"Type: {node_type(node_id)}", ""]
-            lines.append(f"Outbound edges: {len(outbound)}")
+            lines.append(f"Outbound edges: {count(outbound)}")
             for t in outbound[:MAX_INFO_EDGES]:
                 props = t.get("props", {})
                 prop_str = f"  {json.dumps(props, default=str)}" if props else ""
                 lines.append(f"  -[{t['predicate']}]-> {t['object']}{prop_str}")
             if len(outbound) > MAX_INFO_EDGES:
-                lines.append(f"  ... and {len(outbound) - MAX_INFO_EDGES} more")
+                lines.append(f"  ... and {count(outbound, MAX_INFO_EDGES)} more")
 
-            lines.append(f"\nInbound edges: {len(inbound)}")
+            lines.append(f"\nInbound edges: {count(inbound)}")
             for t in inbound[:MAX_INFO_EDGES]:
                 props = t.get("props", {})
                 prop_str = f"  {json.dumps(props, default=str)}" if props else ""
                 lines.append(f"  {t['subject']} -[{t['predicate']}]->{prop_str}")
             if len(inbound) > MAX_INFO_EDGES:
-                lines.append(f"  ... and {len(inbound) - MAX_INFO_EDGES} more")
+                lines.append(f"  ... and {count(inbound, MAX_INFO_EDGES)} more")
 
             return "\n".join(lines)
 
@@ -660,7 +683,7 @@ def create_app(client, namespace):
         if hubs:
             lines.append(html.Div(f"Hubs not expanded (> {MAX_EXPAND_DEGREE} edges):",
                                   style={"marginTop": "8px"}))
-            for nid, degree in sorted(hubs.items(), key=lambda h: -h[1]):
+            for nid, degree in sorted(hubs.items(), key=lambda h: -int(h[1].rstrip("+"))):
                 lines.append(html.Div(f"  {nid}: {degree} edges",
                                       style={"color": "#D84315", "paddingLeft": "8px"}))
         lines.append(html.Hr())
@@ -692,6 +715,8 @@ def main():
     parser.add_argument("--alternate-access", action="store_true",
                         help="Connect via the nodes' alternate-access-address (cloud/NAT/Docker)")
     parser.add_argument("--listen-port", type=int, default=8050, help="Viewer web port (default: 8050)")
+    parser.add_argument("--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE,
+                        help=f"Triples sampled for node search and predicates (default: {DEFAULT_SAMPLE_SIZE})")
     parser.add_argument("--debug", action="store_true", help="Enable Dash debug mode")
     args = parser.parse_args()
 
@@ -703,7 +728,7 @@ def main():
     )
     print(f"Connected to Aerospike at {args.hosts or f'{args.host}:{args.port}'}, namespace={args.namespace}")
 
-    app = create_app(client, namespace)
+    app = create_app(client, namespace, args.sample_size)
     print(f"Starting viewer at http://127.0.0.1:{args.listen_port}")
     app.run(debug=args.debug, host="0.0.0.0", port=args.listen_port)
 

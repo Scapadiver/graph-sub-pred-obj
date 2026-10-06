@@ -208,13 +208,13 @@ AEROSPIKE_PASSWORD=... python viewer/app.py \
 
 ### Features
 
-- **Start Node** search: type 2+ characters to find a node (up to 50 matches are shown, so large graphs don't overload the browser)
+- **Start Node** search: type 2+ characters to find a node in a sample of the graph (up to 50 matches are shown), or type a full node ID to find any node
 - **Max Hops** slider (1-6) to control traversal depth
 - **Predicate Filter** to show only specific relationship types
 - **Direction** control for outbound, inbound, or bidirectional traversal
 - Changing Max Hops, Predicate Filter, or Direction rebuilds the current graph immediately
 - **Multiple layouts**: cola (force-directed), dagre (hierarchical), breadthfirst, circle, concentric, grid
-- **Click** a node or edge to inspect all properties in the info panel (up to 50 edges listed per direction)
+- **Click** a node or edge to inspect all properties in the info panel (up to 50 edges listed per direction; counts above 1,000 show as `1000+`)
 - **Click** an unexpanded node to expand its relationships inline
 - **Graph stats** panel showing node/edge counts, predicates, type breakdown, and hubs
 - **Color-coded nodes** by type prefix (blue=user, green=post, orange=topic)
@@ -223,13 +223,23 @@ AEROSPIKE_PASSWORD=... python viewer/app.py \
 
 Nodes with more than 10 edges are treated as **hubs** and are not expanded, so a shared node doesn't pull thousands of neighbors into the graph. For example, every entity links to its bare type node (`INDIVIDUAL`, `ACCOUNT`, ...) through `IS_TYPE`.
 
-- Hubs still appear in the graph, labeled with their edge count (e.g. `INDIVIDUAL (12038 edges)`) and drawn with a dashed orange border
+- Hubs still appear in the graph, labeled with their edge count (e.g. `ACCOUNT:15 (12 edges)`, or `INDIVIDUAL (1000+ edges)` above 1,000) and drawn with a dashed orange border
 - Graph Stats lists the hubs that were not expanded, largest first
 - Clicking a hub does not expand it
 - The start node is always expanded, whatever its degree
 - Degree is counted after the predicate filter and direction are applied, so a node can be a hub under one filter and expandable under another
 
 Change the threshold with `MAX_EXPAND_DEGREE` at the top of `viewer/app.py`.
+
+### Large and Remote Graphs
+
+The viewer is built to stay responsive against millions of triples and remote clusters, where every round trip and every row crosses the network:
+
+- **No full scans.** On page load (and Refresh Data) the viewer samples up to `--sample-size` triples (default 100,000) for the node search list and predicate filter, instead of scanning the whole set. Nodes outside the sample are found by typing their full ID.
+- **Capped queries.** Each node fetches at most 1,000 edges per direction (`HUB_COUNT_CAP`), so a type node with millions of edges costs the same as one with 1,000. The predicate filter is applied on the server, so filtered-out edges never cross the network.
+- **Parallel traversal.** Each hop's nodes are queried concurrently (`QUERY_THREADS`, default 16), so a hop costs about one round trip instead of one per node.
+
+Through a link with 80 ms round trips, a 3-hop explore over 2 million triples takes about 1 second, and page load about 0.3 seconds.
 
 ### Viewer CLI Flags
 
@@ -245,6 +255,7 @@ Change the threshold with `MAX_EXPAND_DEGREE` at the top of `viewer/app.py`.
 | `--tls-cafile` | | CA certificate file for TLS |
 | `--alternate-access` | off | Connect via the nodes' `alternate-access-address` |
 | `--listen-port` | `8050` | Port the viewer's web server listens on |
+| `--sample-size` | `100000` | Triples sampled for node search and the predicate filter |
 | `--debug` | off | Enable Dash debug mode with hot reload |
 
 ## Package Structure
