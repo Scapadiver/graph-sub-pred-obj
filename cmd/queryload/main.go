@@ -183,6 +183,7 @@ func main() {
 	hopFanout := flag.Int("hop-fanout", 10, "Max second-hop nodes queried per hop2 traversal")
 	clientIndex := flag.Int("client-index", 0, "This process's index (0-based) when running on multiple hosts; picks which partitions to sample")
 	clientCount := flag.Int("client-count", 1, "Total number of query load processes")
+	short := flag.Bool("short-queries", true, "Run secondary index queries as short queries (for results under ~100 records); avoids FAIL_FORBIDDEN rejections at high concurrency")
 	jsonOut := flag.Bool("json", false, "Print the summary as JSON")
 	flag.Parse()
 
@@ -208,6 +209,9 @@ func main() {
 		log.Fatalf("failed to connect: %v", err)
 	}
 	defer gs.Close()
+	if *short {
+		gs.UseShortQueries()
+	}
 
 	begin := *clientIndex * store.PartitionCount / *clientCount
 	end := (*clientIndex + 1) * store.PartitionCount / *clientCount
@@ -224,8 +228,8 @@ func main() {
 		}
 	}
 	logf("Sampled %d triples from partitions %d-%d\n", len(sample), begin, end-1)
-	logf("Running %d workers for %s (target qps: %s), mix: %s\n\n", *workers, *duration,
-		map[bool]string{true: "unlimited", false: strconv.Itoa(*qps)}[*qps == 0], *mix)
+	logf("Running %d workers for %s (target qps: %s, short queries: %t), mix: %s\n\n", *workers, *duration,
+		map[bool]string{true: "unlimited", false: strconv.Itoa(*qps)}[*qps == 0], *short, *mix)
 
 	q := &querier{gs: gs, limit: *limit, hopFanout: *hopFanout}
 	start := time.Now()

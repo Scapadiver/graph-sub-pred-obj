@@ -147,6 +147,14 @@ func newGraphStore(client *aero.Client, namespace string) *GraphStore {
 	}
 }
 
+// UseShortQueries runs secondary index queries as short queries, which the
+// server optimizes for small results (under ~100 records) at high rates. They
+// run on service threads, so they aren't rejected with FAIL_FORBIDDEN when
+// concurrent queries exceed the server's query-threads-limit.
+func (gs *GraphStore) UseShortQueries() {
+	gs.QueryPolicy.ExpectedDuration = aero.SHORT
+}
+
 // Close shuts down the Aerospike client connection.
 func (gs *GraphStore) Close() {
 	gs.Client.Close()

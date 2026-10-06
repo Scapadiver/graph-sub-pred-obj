@@ -221,12 +221,15 @@ total       14398       1434        0      9.1     33.01    140.60    197.73    
 | `-mix` | `spo=30,s=20,o=10,sp=15,po=15,hop2=10` | Query mix as `name=weight` |
 | `-sample` | `10000` | Triples sampled as query keys |
 | `-max-results` | `100` | Max triples returned per secondary index query |
+| `-short-queries` | on | Run secondary index queries as short queries, which the server optimizes for small results at high rates. Long queries count against the server's `query-threads-limit` (default 128) and are rejected with `FAIL_FORBIDDEN: Operation not allowed at this time` beyond it. Turn off (`-short-queries=false`) when `-max-results` is well above 100 |
 | `-hop-fanout` | `10` | Max second-hop nodes queried per `hop2` |
 | `-client-index`, `-client-count` | `0`, `1` | Split sampling between processes on multiple hosts, as with the generator |
 | `-json` | off | Print the summary as JSON, for collecting results from many hosts |
 | `-namespace` | `test` | Aerospike namespace |
 
 Plus the [connection flags](#connecting-to-aerospike). To load-test a cluster, run one `queryload` per client host (each with its own `-client-index`) and add up the totals.
+
+Set `-conn-queue` to at least `-workers` (plus room for `hop2` fan-out); the client's default of 100 connections per node otherwise fails queries with `NO_AVAILABLE_CONNECTIONS_TO_NODE`. Each worker has one query in flight, so throughput is at most `workers / round-trip time`: run from a host in the same region as the cluster to measure the cluster rather than the network.
 
 ### What to Expect
 
