@@ -17,9 +17,30 @@ go build -o graph-spo .
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-host` | `127.0.0.1` | Aerospike server host |
-| `-port` | `3000` | Aerospike server port |
 | `-namespace` | `test` | Aerospike namespace |
+
+Plus the [connection flags](#connecting-to-aerospike).
+
+## Connecting to Aerospike
+
+`graph-spo` and the content generator share these flags for reaching a local or remote cluster:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-host` | `127.0.0.1` | Aerospike host |
+| `-port` | `3000` | Aerospike port |
+| `-hosts` | | Comma-separated seed hosts `host[:port]`; overrides `-host`/`-port` |
+| `-user` | | User, for clusters with security enabled |
+| `-password` | `$AEROSPIKE_PASSWORD` | Password; prefer the environment variable to keep it out of shell history |
+| `-tls-name` | | TLS name of the cluster nodes; enables TLS |
+| `-tls-cafile` | | CA certificate file for TLS |
+| `-alternate-access` | off | Connect via the nodes' `alternate-access-address`, for clusters behind NAT, in the cloud, or in Docker |
+| `-conn-queue` | client default (100) | Max connections per node; raise for many workers per host |
+
+```bash
+AEROSPIKE_PASSWORD=... go run ./cmd/generate/ \
+  -hosts 10.0.1.10:3000,10.0.1.11:3000 -user loader -alternate-access
+```
 
 ## Data Model
 
@@ -74,15 +95,18 @@ go run ./cmd/generate/ \
 |------|---------|-------------|
 | `-count` | `1000` | Number of INDIVIDUALs to generate |
 | `-batch` | `256` | Batch write size |
-| `-workers` | `8` | Concurrent writer goroutines |
+| `-workers` | `8` | Concurrent generator and writer goroutines |
 | `-content-types` | `descriptors/contentTypes.json` | Path to content types descriptor |
 | `-ontology` | `descriptors/ontology.json` | Path to ontology descriptor |
 | `-cardinalities` | `descriptors/cardinalities.json` | Path to cardinalities descriptor |
 | `-share-rate` | `0.2` | Probability an INDIVIDUAL links to an existing entity instead of creating a new one |
 | `-hash-type` | `no-hash` | Hash all content: `no-hash`, `sha-256`, or `sha-512` |
-| `-host` | `127.0.0.1` | Aerospike host |
-| `-port` | `3000` | Aerospike port |
+| `-client-index` | `0` | This generator's index (0-based) when running on multiple hosts |
+| `-client-count` | `1` | Total number of generators running at the same time |
+| `-rebuild-entities` | off | Rebuild the `entities` set and ID counter from existing triples, then exit |
 | `-namespace` | `test` | Aerospike namespace |
+
+Plus the [connection flags](#connecting-to-aerospike).
 
 ### What It Generates
 
@@ -96,11 +120,39 @@ Each INDIVIDUAL produces ~80 triples including:
 
 Sharing is expressed purely as triples that reuse an existing entity's ID, so relations form naturally when the RDF content is loaded. A shared entity is linked to, but its own identifier, type, and outgoing relationship triples are not generated again.
 
-Before generating, the tool scans the existing `triples` set once to:
-- **Resume ID numbering** above the highest ID already used, so repeated runs never collide with earlier data. The high-water mark is also kept in the `meta` set (record `id_counter`), since IDs can't be read back from hashed content
-- **Seed the share pools** with existing entities and how many INDIVIDUALs already link to each, so new content links into the existing graph without exceeding the caps
+Generators never scan the `triples` set during a load. Two small sets hold the state they need:
 
-Entities that reach their cap leave the pool. Each pool holds up to 100,000 entities per type. Two generator runs writing at the same time can still collide, so run them one at a time.
+| Set | Record | Contents |
+|-----|--------|----------|
+| `meta` | `id_counter` | Highest ID reserved. Each generator atomically reserves blocks of 100,000 IDs, so any number of generators on any hosts never collide |
+| `entities` | one per shareable entity | Entity ID, its (hashed) type, and how many INDIVIDUALs link to it |
+
+At startup each generator loads its slice of the `entities` set, then links ~20% of INDIVIDUAL relations to those entities, never past their cardinality cap. New link counts are written back as atomic increments every 2 seconds and at the end. Entities that reach their cap leave the pool; each pool holds up to 100,000 entities per type. HOUSEHOLDs are shared the same way with no cap.
+
+### Initial and Incremental Loads on Multiple Hosts
+
+Run one generator per client host, all with the same `-client-count` and a distinct `-client-index`:
+
+```bash
+# host A                                   # host B
+go run ./cmd/generate/ -hosts ... \        go run ./cmd/generate/ -hosts ... \
+  -count 1000000 -workers 32 \               -count 1000000 -workers 32 \
+  -client-index 0 -client-count 2             -client-index 1 -client-count 2
+```
+
+The same commands serve the initial load (into an empty set) and each periodic incremental load. The 4,096 partitions of the `entities` set are split evenly between clients, so each client shares a disjoint set of existing entities and the caps hold exactly across hosts without a database round trip per link. Run more than one generator per host the same way, giving each its own index.
+
+Caps are only guaranteed between generators started with the same `-client-count`; don't overlap two loads that split the partitions differently. ID uniqueness holds regardless.
+
+#### Data Loaded Before the `entities` Set
+
+A generator refuses to write into a `triples` set that has data but no ID counter. Run a rebuild once, from one host, with no loads running:
+
+```bash
+go run ./cmd/generate/ -rebuild-entities              # plus -hash-type for hashed data
+```
+
+It scans all triples, writes the `entities` set with exact link counts, and raises the ID counter above the highest existing ID. It only recognizes content of the given `-hash-type`; run it once per hash type present.
 
 #### cardinalities.json
 
@@ -132,7 +184,7 @@ In the viewer, hashed nodes have no type prefix, so they all appear in the defau
 
 ### Performance
 
-Benchmarked at ~300K triples/sec with 8 workers on a single Aerospike node.
+Benchmarked at ~300K triples/sec with 8 workers on a single Aerospike node. Three generators running in parallel on one laptop against a single local node sustained ~440K triples/sec combined. Throughput scales with client hosts and cluster nodes; raise `-workers` (and `-conn-queue` if needed) for remote clusters, where each batch spends longer on the network.
 
 ## Interactive Graph Viewer
 
@@ -146,6 +198,13 @@ python viewer/app.py --host 127.0.0.1 --port 3000 --namespace test
 ```
 
 Then open http://127.0.0.1:8050 in your browser.
+
+For a remote cluster:
+
+```bash
+AEROSPIKE_PASSWORD=... python viewer/app.py \
+  --hosts 10.0.1.10:3000,10.0.1.11:3000 --user viewer --alternate-access
+```
 
 ### Features
 
@@ -178,23 +237,33 @@ Change the threshold with `MAX_EXPAND_DEGREE` at the top of `viewer/app.py`.
 |------|---------|-------------|
 | `--host` | `127.0.0.1` | Aerospike host |
 | `--port` | `3000` | Aerospike port |
+| `--hosts` | | Comma-separated seed hosts `host[:port]`; overrides `--host`/`--port` |
 | `--namespace` | `test` | Aerospike namespace |
+| `--user` | | User, for clusters with security enabled |
+| `--password` | `$AEROSPIKE_PASSWORD` | Password |
+| `--tls-name` | | TLS name of the cluster nodes; enables TLS |
+| `--tls-cafile` | | CA certificate file for TLS |
+| `--alternate-access` | off | Connect via the nodes' `alternate-access-address` |
+| `--listen-port` | `8050` | Port the viewer's web server listens on |
 | `--debug` | off | Enable Dash debug mode with hot reload |
 
 ## Package Structure
 
 ```
 model/triple.go      Triple struct, key hashing, type helpers
-store/client.go      Aerospike connection and policy configuration
+store/client.go      Connection flags (seeds, auth, TLS, alternate access) and policies
 store/index.go       Secondary index creation
 store/writer.go      PutTriple, BatchPutTriples, DeleteTriple, UpdateTripleProperty
-store/reader.go      GetTriple, QueryBySubject/Predicate/Object, QuerySP/PO/SO, ScanAll
+store/reader.go      GetTriple, QueryBySubject/Predicate/Object, QuerySP/PO/SO, ScanAll, ScanEach
+store/meta.go        Atomic ID counter reservation (meta set)
+store/entities.go    Shareable entity link counts (entities set), partitioned scans
 graph/query.go       PatternQuery dispatcher for all 7 RDF patterns
 graph/traverse.go    BFS outbound/inbound traversal with depth limits
 ingest/loader.go     Batch and channel-based streaming ingestion
-cmd/generate/main.go Content generator driven by descriptor JSON files
+cmd/generate/        Content generator: main.go (flags, pipeline), graph.go (triples),
+                     pool.go (sharing, rebuild), ids.go (hashing, ID blocks)
 viewer/app.py        Interactive web-based graph viewer (Dash + Cytoscape)
-descriptors/         Content type and ontology JSON descriptors
+descriptors/         Content type, ontology, and cardinality JSON descriptors
 ```
 
 ## Example

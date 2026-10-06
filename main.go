@@ -13,13 +13,13 @@ import (
 )
 
 func main() {
-	host := flag.String("host", "127.0.0.1", "Aerospike server host")
-	port := flag.Int("port", 3000, "Aerospike server port")
+	var conn store.ConnConfig
+	conn.RegisterFlags(flag.CommandLine)
 	namespace := flag.String("namespace", "test", "Aerospike namespace")
 	flag.Parse()
 
 	// Connect to Aerospike
-	gs, err := store.NewGraphStore(*host, *port, *namespace)
+	gs, err := conn.Connect(*namespace)
 	if err != nil {
 		log.Fatalf("failed to connect: %v", err)
 	}

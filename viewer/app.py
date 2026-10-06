@@ -12,6 +12,7 @@ Usage:
 import argparse
 import hashlib
 import json
+import os
 
 import aerospike
 import dash
@@ -40,8 +41,35 @@ MAX_EXPAND_DEGREE = 10
 MAX_INFO_EDGES = 50
 
 
-def connect_aerospike(host, port, namespace):
-    config = {"hosts": [(host, port)]}
+def parse_hosts(hosts, default_port, tls_name=None):
+    """Parse "host[:port],host[:port]" into Aerospike client host tuples."""
+    seeds = []
+    for h in hosts.split(","):
+        h = h.strip()
+        if not h:
+            continue
+        name, _, port = h.rpartition(":") if ":" in h else (h, "", "")
+        seed = (name, int(port) if port else default_port)
+        if tls_name:
+            seed += (tls_name,)
+        seeds.append(seed)
+    return seeds
+
+
+def connect_aerospike(host, port, namespace, hosts=None, user=None, password=None,
+                      tls_name=None, tls_cafile=None, alternate_access=False):
+    """Connect to a local or remote cluster; hosts overrides host/port."""
+    config = {
+        "hosts": parse_hosts(hosts or f"{host}:{port}", port, tls_name),
+        "use_services_alternate": alternate_access,
+    }
+    if user:
+        config["user"] = user
+        config["password"] = password or os.environ.get("AEROSPIKE_PASSWORD", "")
+    if tls_name or tls_cafile:
+        config["tls"] = {"enable": True}
+        if tls_cafile:
+            config["tls"]["cafile"] = tls_cafile
     client = aerospike.client(config).connect()
     return client, namespace
 
@@ -655,17 +683,29 @@ def main():
     parser = argparse.ArgumentParser(description="RDF Property Graph Viewer")
     parser.add_argument("--host", default="127.0.0.1", help="Aerospike host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=3000, help="Aerospike port (default: 3000)")
+    parser.add_argument("--hosts", help="Comma-separated seed hosts host[:port] (overrides --host/--port)")
     parser.add_argument("--namespace", default="test", help="Aerospike namespace (default: test)")
+    parser.add_argument("--user", help="Aerospike user (security-enabled clusters)")
+    parser.add_argument("--password", help="Aerospike password (default: $AEROSPIKE_PASSWORD)")
+    parser.add_argument("--tls-name", help="TLS name of the cluster nodes; enables TLS")
+    parser.add_argument("--tls-cafile", help="CA certificate file for TLS")
+    parser.add_argument("--alternate-access", action="store_true",
+                        help="Connect via the nodes' alternate-access-address (cloud/NAT/Docker)")
+    parser.add_argument("--listen-port", type=int, default=8050, help="Viewer web port (default: 8050)")
     parser.add_argument("--debug", action="store_true", help="Enable Dash debug mode")
     args = parser.parse_args()
 
     global client, namespace
-    client, namespace = connect_aerospike(args.host, args.port, args.namespace)
-    print(f"Connected to Aerospike at {args.host}:{args.port}, namespace={args.namespace}")
+    client, namespace = connect_aerospike(
+        args.host, args.port, args.namespace, hosts=args.hosts, user=args.user,
+        password=args.password, tls_name=args.tls_name, tls_cafile=args.tls_cafile,
+        alternate_access=args.alternate_access,
+    )
+    print(f"Connected to Aerospike at {args.hosts or f'{args.host}:{args.port}'}, namespace={args.namespace}")
 
     app = create_app(client, namespace)
-    print("Starting viewer at http://127.0.0.1:8050")
-    app.run(debug=args.debug, host="0.0.0.0", port=8050)
+    print(f"Starting viewer at http://127.0.0.1:{args.listen_port}")
+    app.run(debug=args.debug, host="0.0.0.0", port=args.listen_port)
 
 
 if __name__ == "__main__":

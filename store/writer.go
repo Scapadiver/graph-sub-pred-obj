@@ -1,6 +1,8 @@
 package store
 
 import (
+	"fmt"
+
 	"graph-sub-pred-obj/model"
 
 	aero "github.com/aerospike/aerospike-client-go/v8"
@@ -51,7 +53,29 @@ func (gs *GraphStore) BatchPutTriples(triples []*model.Triple) error {
 		records = append(records, bw)
 	}
 
-	return gs.Client.BatchOperate(gs.BatchPolicy, records)
+	if err := gs.Client.BatchOperate(gs.BatchPolicy, records); err != nil {
+		return err
+	}
+	return batchRecordErrors(records)
+}
+
+// batchRecordErrors reports per-record failures, which BatchOperate does not
+// return as an error.
+func batchRecordErrors(records []aero.BatchRecordIfc) error {
+	failed := 0
+	var first aero.Error
+	for _, r := range records {
+		if br := r.BatchRec(); br.Err != nil {
+			if first == nil {
+				first = br.Err
+			}
+			failed++
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d of %d batch records failed, first: %w", failed, len(records), first)
+	}
+	return nil
 }
 
 // DeleteTriple removes a triple by its SPO key.
