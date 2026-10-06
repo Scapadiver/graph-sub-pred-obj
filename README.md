@@ -79,6 +79,7 @@ go run ./cmd/generate/ \
 | `-ontology` | `descriptors/ontology.json` | Path to ontology descriptor |
 | `-cardinalities` | `descriptors/cardinalities.json` | Path to cardinalities descriptor |
 | `-share-rate` | `0.2` | Probability an INDIVIDUAL links to an existing entity instead of creating a new one |
+| `-hash-type` | `no-hash` | Hash all content: `no-hash`, `sha-256`, or `sha-512` |
 | `-host` | `127.0.0.1` | Aerospike host |
 | `-port` | `3000` | Aerospike port |
 | `-namespace` | `test` | Aerospike namespace |
@@ -96,7 +97,7 @@ Each INDIVIDUAL produces ~80 triples including:
 Sharing is expressed purely as triples that reuse an existing entity's ID, so relations form naturally when the RDF content is loaded. A shared entity is linked to, but its own identifier, type, and outgoing relationship triples are not generated again.
 
 Before generating, the tool scans the existing `triples` set once to:
-- **Resume ID numbering** above the highest ID already stored, so repeated runs never collide with earlier data
+- **Resume ID numbering** above the highest ID already used, so repeated runs never collide with earlier data. The high-water mark is also kept in the `meta` set (record `id_counter`), since IDs can't be read back from hashed content
 - **Seed the share pools** with existing entities and how many INDIVIDUALs already link to each, so new content links into the existing graph without exceeding the caps
 
 Entities that reach their cap leave the pool. Each pool holds up to 100,000 entities per type. Two generator runs writing at the same time can still collide, so run them one at a time.
@@ -116,6 +117,18 @@ Entities that reach their cap leave the pool. Each pool holds up to 100,000 enti
 ```
 
 Types without an entry are never shared. Only `LINKED_TO: "INDIVIDUAL"` is supported; other entries are ignored with a warning.
+
+### Content Hashing
+
+`-hash-type sha-256` or `-hash-type sha-512` hashes every subject, predicate, object, and string property value (hex-encoded) before it is written; numeric properties such as timestamps and decay are left as-is.
+
+```
+6a153dffeaf6dfe8… -[e703d71a03e5bc25…]-> 566c4ba49a631c57…
+```
+
+Hashing is deterministic, so identical content still produces identical nodes and relations form naturally. Sharing and ID resumption work on hashed data by hashing the known vocabulary (type names and predicates) to recognize `IS_TYPE` triples and INDIVIDUAL links. A run only shares with content hashed the same way; mixing hash types in one set produces separate, unconnected graphs.
+
+In the viewer, hashed nodes have no type prefix, so they all appear in the default color, and the predicate filter lists hashed predicates.
 
 ### Performance
 

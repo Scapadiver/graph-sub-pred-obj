@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -100,17 +103,38 @@ func idCounterValue(id string) int64 {
 	return n
 }
 
-func entityType(id string) string {
-	for i := 0; i < len(id); i++ {
-		if id[i] == ':' {
-			return id[:i]
-		}
+// idCounterName is the meta record holding the highest ID used, since IDs
+// can't be recovered from hashed content.
+const idCounterName = "id_counter"
+
+// ---------------------------------------------------------------------------
+// Content hashing
+// ---------------------------------------------------------------------------
+
+// hashContent is applied to every subject, predicate, object and string prop
+// as it is created. Hashing is deterministic, so identical content still links.
+var hashContent = func(s string) string { return s }
+
+func newHashFunc(hashType string) (func(string) string, error) {
+	switch hashType {
+	case "no-hash":
+		return func(s string) string { return s }, nil
+	case "sha-256":
+		return func(s string) string {
+			sum := sha256.Sum256([]byte(s))
+			return hex.EncodeToString(sum[:])
+		}, nil
+	case "sha-512":
+		return func(s string) string {
+			sum := sha512.Sum512([]byte(s))
+			return hex.EncodeToString(sum[:])
+		}, nil
 	}
-	return ""
+	return nil, fmt.Errorf("unknown hash type %q (want no-hash, sha-256, or sha-512)", hashType)
 }
 
 func generateEntityID(contentType string) string {
-	return fmt.Sprintf("%s:%d", contentType, nextID())
+	return hashContent(fmt.Sprintf("%s:%d", contentType, nextID()))
 }
 
 func generateIdentifierValue(propName string) string {
@@ -133,11 +157,11 @@ func generateEntityTriples(entityID string, contentType string, propDefs map[str
 
 		triples = append(triples, &model.Triple{
 			Subject:   entityID,
-			Predicate: "HAS_IDENTIFIER",
-			Object:    fmt.Sprintf("%s:%s", propName, value),
+			Predicate: hashContent("HAS_IDENTIFIER"),
+			Object:    hashContent(fmt.Sprintf("%s:%s", propName, value)),
 			Props: map[string]interface{}{
-				"identifier_type": propName,
-				"value":           value,
+				"identifier_type": hashContent(propName),
+				"value":           hashContent(value),
 				"created":         now,
 				"last_seen":       now,
 				"decay":           meta.Decay,
@@ -148,8 +172,8 @@ func generateEntityTriples(entityID string, contentType string, propDefs map[str
 	// Entity type triple
 	triples = append(triples, &model.Triple{
 		Subject:   entityID,
-		Predicate: "IS_TYPE",
-		Object:    contentType,
+		Predicate: hashContent("IS_TYPE"),
+		Object:    hashContent(contentType),
 		Props: map[string]interface{}{
 			"created": now,
 		},
@@ -238,28 +262,63 @@ func (p *sharePool) pick(entityType string, exclude map[string]bool, rng *rand.R
 	return "", false
 }
 
-// loadExisting scans the store once to resume ID numbering above existing data
-// and to seed the share pools with existing entities, so new content links
-// into the graph already loaded.
-func loadExisting(gs *store.GraphStore, pool *sharePool, sharedHouseholds map[string]string, rng *rand.Rand) (int, error) {
-	var maxID int64
+// individualPredicates returns the predicates only ever used with an
+// INDIVIDUAL subject, so links can be counted without knowing subject types.
+func individualPredicates(ontology []OntologyRelation) map[string]bool {
+	preds := make(map[string]bool)
+	for _, rel := range ontology {
+		if rel.Sub == "INDIVIDUAL" {
+			preds[rel.Pred] = true
+		}
+	}
+	for _, rel := range ontology {
+		if rel.Sub != "INDIVIDUAL" {
+			delete(preds, rel.Pred)
+		}
+	}
+	return preds
+}
+
+// loadExisting scans existing triples once to resume ID numbering above
+// existing data (starting from savedID, the stored high-water mark) and to
+// seed the share pools with existing entities, so new content links into the
+// graph already loaded. Entity types come from IS_TYPE triples, so this works
+// on hashed content; only content hashed the same way is matched.
+func loadExisting(scan func(func(*model.Triple) error) error, savedID int64, pool *sharePool, ontology []OntologyRelation, sharedHouseholds map[string]string, rng *rand.Rand) (int, error) {
+	maxID := savedID
+
+	isType := hashContent("IS_TYPE")
+	household := hashContent("HOUSEHOLD")
+	typeNames := make(map[string]string) // hashed type -> type
+	for t := range pool.caps {
+		typeNames[hashContent(t)] = t
+	}
+	linkPreds := make(map[string]bool)
+	for p := range individualPredicates(ontology) {
+		linkPreds[hashContent(p)] = true
+	}
+
 	var scanned int
+	types := make(map[string]string) // entity -> type, for shareable types
 	individualLinks := make(map[string]int)
 
-	err := gs.ScanEach(func(t *model.Triple) error {
+	err := scan(func(t *model.Triple) error {
 		scanned++
+		// Unhashed content from earlier runs carries its counter
 		for _, id := range []string{t.Subject, t.Object} {
 			if n := idCounterValue(id); n > maxID {
 				maxID = n
 			}
 		}
-		if entityType(t.Subject) == "INDIVIDUAL" {
-			if _, ok := pool.caps[entityType(t.Object)]; ok {
-				individualLinks[t.Object]++
+		switch {
+		case t.Predicate == isType:
+			if typ, ok := typeNames[t.Object]; ok {
+				types[t.Subject] = typ
+			} else if t.Object == household && len(sharedHouseholds) < maxPoolPerType {
+				sharedHouseholds[t.Subject] = t.Subject
 			}
-		}
-		if t.Predicate == "IS_TYPE" && t.Object == "HOUSEHOLD" && len(sharedHouseholds) < maxPoolPerType {
-			sharedHouseholds[t.Subject] = t.Subject
+		case linkPreds[t.Predicate]:
+			individualLinks[t.Object]++
 		}
 		return nil
 	})
@@ -269,7 +328,9 @@ func loadExisting(gs *store.GraphStore, pool *sharePool, sharedHouseholds map[st
 
 	idCounter.Store(maxID)
 	for id, count := range individualLinks {
-		pool.add(entityType(id), id, count, rng)
+		if typ, ok := types[id]; ok {
+			pool.add(typ, id, count, rng)
+		}
 	}
 	return scanned, nil
 }
@@ -342,7 +403,7 @@ func generateIndividualGraph(
 
 			g.triples = append(g.triples, &model.Triple{
 				Subject:   individualID,
-				Predicate: rel.Pred,
+				Predicate: hashContent(rel.Pred),
 				Object:    householdID,
 				Props: map[string]interface{}{
 					"created":   now,
@@ -370,7 +431,7 @@ func generateIndividualGraph(
 			// Create the relationship triple
 			g.triples = append(g.triples, &model.Triple{
 				Subject:   individualID,
-				Predicate: rel.Pred,
+				Predicate: hashContent(rel.Pred),
 				Object:    objID,
 				Props: map[string]interface{}{
 					"created":   now,
@@ -414,7 +475,7 @@ func generateIndividualGraph(
 
 				g.triples = append(g.triples, &model.Triple{
 					Subject:   subID,
-					Predicate: rel.Pred,
+					Predicate: hashContent(rel.Pred),
 					Object:    objID,
 					Props: map[string]interface{}{
 						"created":   now,
@@ -462,7 +523,7 @@ func generateIndividualGraph(
 
 				g.triples = append(g.triples, &model.Triple{
 					Subject:   subID,
-					Predicate: rel.Pred,
+					Predicate: hashContent(rel.Pred),
 					Object:    objID,
 					Props: map[string]interface{}{
 						"created":   now,
@@ -516,7 +577,13 @@ func main() {
 	ontologyPath := flag.String("ontology", "descriptors/ontology.json", "Path to ontology.json")
 	cardinalitiesPath := flag.String("cardinalities", "descriptors/cardinalities.json", "Path to cardinalities.json")
 	shareRate := flag.Float64("share-rate", 0.2, "Probability an individual links to an existing entity instead of a new one")
+	hashType := flag.String("hash-type", "no-hash", "Hash all content: no-hash, sha-256, or sha-512")
 	flag.Parse()
+
+	var err error
+	if hashContent, err = newHashFunc(*hashType); err != nil {
+		log.Fatal(err)
+	}
 
 	// Load descriptors
 	ctData, err := os.ReadFile(*contentTypesPath)
@@ -546,8 +613,8 @@ func main() {
 		log.Fatalf("failed to parse cardinalities: %v", err)
 	}
 
-	fmt.Printf("Loaded %d content types, %d ontology relations, %d cardinalities\n",
-		len(ctFile.ContentTypes), len(ontFile.Ontology), len(cardFile.Cardinalities))
+	fmt.Printf("Loaded %d content types, %d ontology relations, %d cardinalities (hash: %s)\n",
+		len(ctFile.ContentTypes), len(ontFile.Ontology), len(cardFile.Cardinalities), *hashType)
 	for ct, props := range ctFile.ContentTypes {
 		fmt.Printf("  %-20s %d identifiers\n", ct, len(props))
 	}
@@ -567,7 +634,11 @@ func main() {
 	pool := newSharePool(*shareRate, cardFile.Cardinalities)
 	sharedHouseholds := make(map[string]string)
 	fmt.Println("Scanning existing graph for shareable entities...")
-	scanned, err := loadExisting(gs, pool, sharedHouseholds, rand.New(rand.NewSource(rand.Int63())))
+	savedID, err := gs.GetCounter(idCounterName)
+	if err != nil {
+		log.Fatalf("failed to read ID counter: %v", err)
+	}
+	scanned, err := loadExisting(gs.ScanEach, savedID, pool, ontFile.Ontology, sharedHouseholds, rand.New(rand.NewSource(rand.Int63())))
 	if err != nil {
 		log.Fatalf("failed to scan existing graph: %v", err)
 	}
@@ -614,6 +685,14 @@ func main() {
 	}
 
 	// Progress reporter
+	// Persist the ID high-water mark so later runs never reuse IDs, even
+	// when content is hashed and IDs can't be read back from the data.
+	saveIDCounter := func() {
+		if err := gs.SetCounter(idCounterName, idCounter.Load()); err != nil {
+			log.Printf("failed to save ID counter: %v", err)
+		}
+	}
+
 	startTime := time.Now()
 	done := make(chan struct{})
 	go func() {
@@ -627,6 +706,7 @@ func main() {
 				rate := float64(written) / elapsed
 				fmt.Printf("\r  triples written: %d  (%.0f/sec)  errors: %d",
 					written, rate, batchErrors.Load())
+				saveIDCounter()
 			case <-done:
 				return
 			}
@@ -658,6 +738,7 @@ func main() {
 	}
 	close(genCh)
 	genWg.Wait()
+	saveIDCounter()
 	close(tripleCh)
 	writeWg.Wait()
 	close(done)
