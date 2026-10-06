@@ -246,12 +246,27 @@ func main() {
 		}
 	}
 
-	// Progress reporter
 	startTime := time.Now()
 	done := make(chan struct{})
-	reporterDone := make(chan struct{})
+
+	// Entity flusher, separate from progress so a slow flush never hides it
+	flusherDone := make(chan struct{})
 	go func() {
-		defer close(reporterDone)
+		defer close(flusherDone)
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				flushEntities()
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// Progress reporter
+	go func() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -262,7 +277,6 @@ func main() {
 				rate := float64(written) / elapsed
 				fmt.Printf("\r  triples written: %d  (%.0f/sec)  errors: %d",
 					written, rate, batchErrors.Load())
-				flushEntities()
 			case <-done:
 				return
 			}
@@ -295,7 +309,7 @@ func main() {
 	close(tripleCh)
 	writeWg.Wait()
 	close(done)
-	<-reporterDone
+	<-flusherDone
 	flushEntities()
 
 	elapsed := time.Since(startTime)

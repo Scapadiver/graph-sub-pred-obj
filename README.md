@@ -65,7 +65,7 @@ All 7 RDF query patterns are supported, automatically selecting the optimal inde
 | `SP?` | Who does Bob follow? | SI on subject + filter on predicate |
 | `S?O` | How is Alice connected to post:101? | SI on subject + filter on object |
 | `S??` | Everything about Alice | SI on subject |
-| `?PO` | Who authored post:101? | SI on predicate + filter on object |
+| `?PO` | Who authored post:101? | SI on object + filter on predicate |
 | `?P?` | All "authored" relationships | SI on predicate |
 | `??O` | Everything pointing to topic:graphs | SI on object |
 
@@ -186,6 +186,63 @@ In the viewer, hashed nodes have no type prefix, so they all appear in the defau
 
 Benchmarked at ~300K triples/sec with 8 workers on a single Aerospike node. Three generators running in parallel on one laptop against a single local node sustained ~440K triples/sec combined. Throughput scales with client hosts and cluster nodes; raise `-workers` (and `-conn-queue` if needed) for remote clusters, where each batch spends longer on the network.
 
+## Query Load Generator
+
+`cmd/queryload` measures query throughput and latency using keys sampled from the data already loaded. It is read-only, so it can run against production-sized data and alongside generator loads to test combined query and insert traffic.
+
+```bash
+go run ./cmd/queryload/ -hosts ... -duration 60s -workers 16
+```
+
+It samples `-sample` triples, then runs a weighted mix of query patterns, printing queries/sec each second and a per-pattern summary:
+
+```
+query         ops        qps   errors  rows/op    p50 ms    p95 ms    p99 ms    max ms
+spo          4286        427        0      1.0      1.64     26.68     51.06    133.86
+s            2871        286        0     10.8     44.59    104.45    139.13    228.85
+...
+total       14398       1434        0      9.1     33.01    140.60    197.73    364.86
+```
+
+| Query | Pattern |
+|-------|---------|
+| `spo` | Primary key get of a known triple |
+| `s` | `S??`: all triples of a subject |
+| `o` | `??O`: all triples pointing to an object |
+| `sp` | `SP?`: subject + predicate |
+| `po` | `?PO`: predicate + object |
+| `hop2` | 2-hop outbound traversal; second hop queried concurrently (counted as one op) |
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-duration` | `30s` | How long to run |
+| `-workers` | `64` | Concurrent query workers |
+| `-qps` | `0` | Target queries/sec for this process; `0` runs as fast as possible. Latency is measured from each query's scheduled start, so queueing behind an overloaded server shows up in the percentiles |
+| `-mix` | `spo=30,s=20,o=10,sp=15,po=15,hop2=10` | Query mix as `name=weight` |
+| `-sample` | `10000` | Triples sampled as query keys |
+| `-max-results` | `100` | Max triples returned per secondary index query |
+| `-hop-fanout` | `10` | Max second-hop nodes queried per `hop2` |
+| `-client-index`, `-client-count` | `0`, `1` | Split sampling between processes on multiple hosts, as with the generator |
+| `-json` | off | Print the summary as JSON, for collecting results from many hosts |
+| `-namespace` | `test` | Aerospike namespace |
+
+Plus the [connection flags](#connecting-to-aerospike). To load-test a cluster, run one `queryload` per client host (each with its own `-client-index`) and add up the totals.
+
+### What to Expect
+
+Measured on one laptop against a single Aerospike node in Docker, with the server and both clients sharing the same CPUs:
+
+| Workload | Result |
+|----------|--------|
+| Primary key gets (`spo`) | ~52K/sec from one client, sub-millisecond |
+| Secondary index queries (`s`, `o`, `sp`, `po`) | ~1.2–2.2K/sec, server-CPU bound (~2.4 ms of server CPU each) regardless of client concurrency |
+| Inserts alone | ~270–335K triples/sec |
+| Inserts + secondary index queries paced at 500/sec | 225K triples/sec inserted |
+| Inserts + secondary index queries at 4 workers | 179K triples/sec inserted, 1.2K queries/sec |
+| Inserts + secondary index queries at 64 workers | 38K triples/sec inserted, 1.3K queries/sec |
+
+Secondary index queries cost far more server CPU than primary key operations, since each consults the index in every partition. Pushing more concurrency at them past the server's capacity adds no query throughput but sharply slows inserts. For high combined rates: pace or limit secondary index query concurrency (`-qps`, `-workers`), add cluster nodes to scale secondary index throughput, and prefer primary key lookups on hot paths.
+
 ## Interactive Graph Viewer
 
 A web-based property graph viewer built with Python, Dash, and Cytoscape. Connects directly to Aerospike and provides interactive visualization of RDF relationships.
@@ -273,6 +330,7 @@ graph/traverse.go    BFS outbound/inbound traversal with depth limits
 ingest/loader.go     Batch and channel-based streaming ingestion
 cmd/generate/        Content generator: main.go (flags, pipeline), graph.go (triples),
                      pool.go (sharing, rebuild), ids.go (hashing, ID blocks)
+cmd/queryload/       Query load generator: throughput and latency by query pattern
 viewer/app.py        Interactive web-based graph viewer (Dash + Cytoscape)
 descriptors/         Content type, ontology, and cardinality JSON descriptors
 ```
