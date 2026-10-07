@@ -35,7 +35,7 @@ Plus the [connection flags](#connecting-to-aerospike).
 | `-tls-name` | | TLS name of the cluster nodes; enables TLS |
 | `-tls-cafile` | | CA certificate file for TLS |
 | `-alternate-access` | off | Connect via the nodes' `alternate-access-address`, for clusters behind NAT, in the cloud, or in Docker |
-| `-conn-queue` | client default (100) | Max connections per node; raise for many workers per host |
+| `-conn-queue` | client default (100) | Max connections per node; set a little above the number of concurrent workers (see [sizing](#sizing-workers-and-connections)) |
 
 ```bash
 AEROSPIKE_PASSWORD=... go run ./cmd/generate/ \
@@ -185,7 +185,7 @@ In the viewer, hashed values are shown as their first 20 characters plus `…` i
 
 ### Performance
 
-Benchmarked at ~300K triples/sec with 8 workers on a single Aerospike node. Three generators running in parallel on one laptop against a single local node sustained ~440K triples/sec combined. Throughput scales with client hosts and cluster nodes; raise `-workers` (and `-conn-queue` if needed) for remote clusters, where each batch spends longer on the network.
+Benchmarked at ~300K triples/sec with 8 workers on a single Aerospike node. Three generators running in parallel on one laptop against a single local node sustained ~440K triples/sec combined. Throughput scales with client hosts and cluster nodes; raise `-workers` (and `-conn-queue` a little above it) for remote clusters, where each batch spends longer on the network.
 
 ## Query Load Generator
 
@@ -230,7 +230,55 @@ total       14398       1434        0      9.1     33.01    140.60    197.73    
 
 Plus the [connection flags](#connecting-to-aerospike). To load-test a cluster, run one `queryload` per client host (each with its own `-client-index`) and add up the totals.
 
-Set `-conn-queue` to at least `-workers` (plus room for `hop2` fan-out); the client's default of 100 connections per node otherwise fails queries with `NO_AVAILABLE_CONNECTIONS_TO_NODE`. Each worker has one query in flight, so throughput is at most `workers / round-trip time`: run from a host in the same region as the cluster to measure the cluster rather than the network.
+### Sizing Workers and Connections
+
+Each worker has one query in flight, so throughput is at most `workers / round-trip time`. Against a remote cluster, raise `-workers` to cover the round trip, and run from a host in the same region as the cluster to measure the cluster rather than the network.
+
+Set `-conn-queue` a little above `-workers` (e.g. 300 for 256 workers), leaving some room for `hop2` fan-out:
+
+- **Too small:** with the client default of 100, more than 100 workers fail with `NO_AVAILABLE_CONNECTIONS_TO_NODE` and time out.
+- **Too large:** a pool far above the worker count lets the client open thousands of connections across the cluster's nodes, which can overwhelm the network path. Against a 2-node cluster, 256 workers with `-conn-queue 2000` dropped from 1,607 to 419 queries/sec with 110 timeouts; `-conn-queue 300` ran clean.
+
+### Examples
+
+The first four commands are the runs used to measure a 2-node cluster in AWS from a Mac about 51 ms away (ping), loaded with 10,000 individuals (684,968 triples, sha-512); results are in the table below. The last two show other options. Replace `<cluster-host>` with a node address; `-alternate-access` is needed when nodes advertise private addresses.
+
+```bash
+# Default mix, default 64 workers
+go run ./cmd/queryload/ -host <cluster-host> -alternate-access -workers 64 -conn-queue 256 -duration 30s
+
+# Default mix, 256 workers
+go run ./cmd/queryload/ -host <cluster-host> -alternate-access -workers 256 -conn-queue 300 -duration 30s
+
+# Primary key gets only
+go run ./cmd/queryload/ -host <cluster-host> -alternate-access -workers 256 -conn-queue 300 -duration 15s -mix spo=1
+
+# Secondary index queries only
+go run ./cmd/queryload/ -host <cluster-host> -alternate-access -workers 256 -conn-queue 300 -duration 15s -mix s=1
+
+# Fixed rate (open loop), latency measured from each query's scheduled start
+go run ./cmd/queryload/ -host <cluster-host> -alternate-access -workers 64 -conn-queue 256 -duration 30s -qps 500
+
+# JSON summary, for collecting results from several hosts
+go run ./cmd/queryload/ -host <cluster-host> -alternate-access -workers 256 -conn-queue 300 -json
+```
+
+| Run | Queries/sec | p50 ms | p99 ms | Errors |
+|-----|-------------|--------|--------|--------|
+| Default mix, 64 workers | 841 | 57 | 215 | 0 |
+| Default mix, 256 workers | 1,607 | 140 | 463 | 0 |
+| Default mix, 256 workers, `-conn-queue 2000` | 419 | 130 | 3,968 | 110 |
+| Primary key gets, 256 workers | 3,984 | 54 | 149 | 0 |
+| Secondary index queries, 256 workers | 2,102 | 110 | 243 | 0 |
+
+Primary key gets stayed at the network round trip (~53 ms), so they were limited by distance, not the cluster. Secondary index queries topped out around 2,100/sec on this 2-node cluster, about 1,700/sec on a 1-node cluster; extra workers beyond that only queue.
+
+To test queries during inserts, run a generator load and `queryload` at the same time, from the same or different hosts:
+
+```bash
+go run ./cmd/generate/ -host <cluster-host> -alternate-access -count 10000 -hash-type sha-512 -workers 32 -conn-queue 128 &
+go run ./cmd/queryload/ -host <cluster-host> -alternate-access -workers 64 -conn-queue 256 -duration 60s
+```
 
 ### What to Expect
 
