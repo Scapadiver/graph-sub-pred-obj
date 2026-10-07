@@ -4,9 +4,9 @@ import (
 	aero "github.com/aerospike/aerospike-client-go/v8"
 )
 
-// EntitySetName holds one record per shareable entity: its (possibly hashed)
-// type and how many INDIVIDUALs link to it. Generators use it to find
-// entities to share without scanning the triples set.
+// EntitySetName holds one record per shareable entity: its type and how many
+// INDIVIDUALs link to it. Generators use it to find entities to share without
+// scanning the triples set.
 const EntitySetName = "entities"
 
 // PartitionCount is the number of Aerospike partitions in a namespace.

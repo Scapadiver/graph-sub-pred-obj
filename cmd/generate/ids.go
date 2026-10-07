@@ -16,9 +16,9 @@ import (
 // Content hashing
 // ---------------------------------------------------------------------------
 
-// hashContent is applied to every subject, object and string prop as it is
-// created; predicates stay readable. Hashing is deterministic, so identical
-// content still links.
+// hashContent is applied to identifier data: each identifier node (the
+// HAS_IDENTIFIER object) and its value prop. Entity IDs, predicates and type
+// names stay readable. Hashing is deterministic, so identical data still links.
 var hashContent = func(s string) string { return s }
 
 func newHashFunc(hashType string) (func(string) string, error) {
@@ -90,7 +90,7 @@ func (a *idAllocator) Next() int64 {
 }
 
 func generateEntityID(contentType string) string {
-	return hashContent(fmt.Sprintf("%s:%d", contentType, ids.Next()))
+	return fmt.Sprintf("%s:%d", contentType, ids.Next())
 }
 
 func generateIdentifierValue(propName string) string {

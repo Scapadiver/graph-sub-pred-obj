@@ -90,7 +90,7 @@ func (p *sharePool) created(entityType, id string, rng *rand.Rand) {
 // markLinked records one new INDIVIDUAL link to persist. Caller holds mu.
 func (p *sharePool) markLinked(entityType, id string) {
 	d := p.dirty[id]
-	d.ID, d.Type = id, hashContent(entityType)
+	d.ID, d.Type = id, entityType
 	d.Links++
 	p.dirty[id] = d
 }
@@ -134,15 +134,6 @@ func (p *sharePool) takeDirty() []store.EntityLinks {
 	return out
 }
 
-// typeNames maps each tracked type's hashed form back to the type.
-func (p *sharePool) typeNames() map[string]string {
-	names := make(map[string]string)
-	for t := range p.limits {
-		names[hashContent(t)] = t
-	}
-	return names
-}
-
 // partitionRange returns the slice of the 4096 partitions owned by client
 // index of count clients.
 func partitionRange(index, count int) (begin, n int) {
@@ -152,13 +143,12 @@ func partitionRange(index, count int) (begin, n int) {
 }
 
 // loadShareable seeds the pool from the entity records in this client's
-// partitions. Records of another hash type are skipped.
+// partitions. Records of untracked types are skipped.
 func loadShareable(scan func(begin, count int, fn func(store.EntityLinks) error) error, begin, count int, pool *sharePool, rng *rand.Rand) (int, error) {
-	names := pool.typeNames()
 	loaded := 0
 	err := scan(begin, count, func(e store.EntityLinks) error {
-		if typ, ok := names[e.Type]; ok {
-			pool.add(typ, e.ID, e.Links, rng)
+		if pool.tracked(e.Type) {
+			pool.add(e.Type, e.ID, e.Links, rng)
 			loaded++
 		}
 		return nil
@@ -184,11 +174,9 @@ func individualPredicates(ontology []OntologyRelation) map[string]bool {
 }
 
 // rebuildEntities scans all triples to recount INDIVIDUAL links for every
-// tracked entity and to find the highest unhashed ID. Entity types come from
-// IS_TYPE triples, so this works on hashed content of the current hash type.
+// tracked entity and to find the highest ID. Entity types come from IS_TYPE
+// triples.
 func rebuildEntities(scan func(func(*model.Triple) error) error, pool *sharePool, ontology []OntologyRelation) ([]store.EntityLinks, int64, int, error) {
-	isType := "IS_TYPE"
-	names := pool.typeNames()
 	linkPreds := make(map[string]bool)
 	for p := range individualPredicates(ontology) {
 		linkPreds[p] = true
@@ -196,7 +184,7 @@ func rebuildEntities(scan func(func(*model.Triple) error) error, pool *sharePool
 
 	var maxID int64
 	var scanned int
-	types := make(map[string]string) // entity -> hashed type
+	types := make(map[string]string) // entity -> type
 	links := make(map[string]int)
 
 	err := scan(func(t *model.Triple) error {
@@ -207,8 +195,8 @@ func rebuildEntities(scan func(func(*model.Triple) error) error, pool *sharePool
 			}
 		}
 		switch {
-		case t.Predicate == isType:
-			if _, ok := names[t.Object]; ok {
+		case t.Predicate == "IS_TYPE":
+			if pool.tracked(t.Object) {
 				types[t.Subject] = t.Object
 			}
 		case linkPreds[t.Predicate]:

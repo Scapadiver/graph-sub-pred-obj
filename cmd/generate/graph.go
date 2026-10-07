@@ -26,7 +26,7 @@ func generateEntityTriples(entityID string, contentType string, propDefs map[str
 			Predicate: "HAS_IDENTIFIER",
 			Object:    hashContent(fmt.Sprintf("%s:%s", propName, value)),
 			Props: map[string]interface{}{
-				"identifier_type": hashContent(propName),
+				"identifier_type": propName,
 				"value":           hashContent(value),
 				"created":         now,
 				"last_seen":       now,
@@ -39,7 +39,7 @@ func generateEntityTriples(entityID string, contentType string, propDefs map[str
 	triples = append(triples, &model.Triple{
 		Subject:   entityID,
 		Predicate: "IS_TYPE",
-		Object:    hashContent(contentType),
+		Object:    contentType,
 		Props: map[string]interface{}{
 			"created": now,
 		},
