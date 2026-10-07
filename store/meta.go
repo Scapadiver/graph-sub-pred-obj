@@ -2,6 +2,8 @@ package store
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 
 	aero "github.com/aerospike/aerospike-client-go/v8"
 )
@@ -11,6 +13,27 @@ const MetaSetName = "meta"
 
 func (gs *GraphStore) counterKey(name string) (*aero.Key, aero.Error) {
 	return aero.NewKey(gs.Namespace, MetaSetName, name)
+}
+
+// SetRecordCount returns the number of records in a set, summed over all
+// nodes (replicas included), from server statistics rather than a scan, so it
+// is instant on any size of namespace. A set that doesn't exist counts as 0.
+func (gs *GraphStore) SetRecordCount(set string) (int64, error) {
+	cmd := fmt.Sprintf("sets/%s/%s", gs.Namespace, set)
+	var total int64
+	for _, node := range gs.Client.GetNodes() {
+		info, err := node.RequestInfo(aero.NewInfoPolicy(), cmd)
+		if err != nil {
+			return 0, fmt.Errorf("%s on %s: %w", cmd, node.GetName(), err)
+		}
+		for _, field := range strings.FieldsFunc(info[cmd], func(r rune) bool { return r == ':' || r == ';' }) {
+			if v, ok := strings.CutPrefix(field, "objects="); ok {
+				n, _ := strconv.ParseInt(v, 10, 64)
+				total += n
+			}
+		}
+	}
+	return total, nil
 }
 
 // GetCounter returns the named counter, or 0 if it has never been set.

@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -69,9 +68,6 @@ var predicateCardinality = map[string]cardinalityRange{
 	"CAN_HAVE_SEVERAL": {1, 5},
 	"HAS_AN":           {1, 1},
 }
-
-// errStopScan ends a scan early.
-var errStopScan = errors.New("stop scan")
 
 func readJSON(path string, v interface{}) {
 	data, err := os.ReadFile(path)
@@ -173,27 +169,34 @@ func main() {
 		log.Fatalf("failed to read ID counter: %v", err)
 	}
 	if counter == 0 {
-		hasData := false
-		err := gs.ScanEach(func(*model.Triple) error {
-			hasData = true
-			return errStopScan
-		})
-		if err != nil && err != errStopScan {
+		existing, err := gs.SetRecordCount(store.SetName)
+		if err != nil {
 			log.Fatalf("failed to check for existing triples: %v", err)
 		}
-		if hasData {
-			log.Fatalf("triples exist but the ID counter is unset; run once with -rebuild-entities first")
+		if existing > 0 {
+			log.Fatalf("%d triples exist but the ID counter is unset; run once with -rebuild-entities first", existing)
 		}
 	}
 	ids.reserve = func(n int64) (int64, error) { return gs.ReserveCounter(idCounterName, n) }
 
 	// Seed sharing from this client's slice of the entities set
 	begin, parts := partitionRange(*clientIndex, *clientCount)
-	fmt.Printf("Client %d of %d: loading shareable entities from partitions %d-%d...\n",
-		*clientIndex, *clientCount, begin, begin+parts-1)
-	loaded, err := loadShareable(gs.ScanEntities, begin, parts, pool, rand.New(rand.NewSource(rand.Int63())))
+	entityCount, err := gs.SetRecordCount(store.EntitySetName)
 	if err != nil {
-		log.Fatalf("failed to load entities: %v", err)
+		log.Fatalf("failed to count entities: %v", err)
+	}
+	loaded := 0
+	if entityCount > 0 {
+		fmt.Printf("Client %d of %d: loading shareable entities from partitions %d-%d...\n",
+			*clientIndex, *clientCount, begin, begin+parts-1)
+		scanStart := time.Now()
+		loaded, err = loadShareable(gs.ScanEntities, begin, parts, pool, rand.New(rand.NewSource(rand.Int63())))
+		if err != nil {
+			log.Fatalf("failed to load entities: %v", err)
+		}
+		fmt.Printf("  scanned in %s\n", time.Since(scanStart).Round(time.Millisecond))
+	} else {
+		fmt.Printf("Client %d of %d: no shareable entities yet\n", *clientIndex, *clientCount)
 	}
 	fmt.Printf("  %d entities loaded, ID counter at %d\n", loaded, counter)
 	for _, c := range cardFile.Cardinalities {
