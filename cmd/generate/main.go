@@ -13,6 +13,7 @@ import (
 
 	"graph-sub-pred-obj/model"
 	"graph-sub-pred-obj/store"
+	"graph-sub-pred-obj/version"
 )
 
 // ---------------------------------------------------------------------------
@@ -108,8 +109,15 @@ func main() {
 	hashType := flag.String("hash-type", "no-hash", "Hash all content: no-hash, sha-256, or sha-512")
 	clientIndex := flag.Int("client-index", 0, "This generator's index (0-based) when running on multiple hosts")
 	clientCount := flag.Int("client-count", 1, "Total number of generators running at the same time")
+	showVersion := flag.Bool("version", false, "Print the build version and exit")
 	rebuild := flag.Bool("rebuild-entities", false, "Rebuild the entities set and ID counter from existing triples, then exit (run once, with no loads running)")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("generate", version.String())
+		return
+	}
+	fmt.Println("generate", version.String())
 
 	var err error
 	if hashContent, err = newHashFunc(*hashType); err != nil {

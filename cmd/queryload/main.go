@@ -20,6 +20,7 @@ import (
 
 	"graph-sub-pred-obj/model"
 	"graph-sub-pred-obj/store"
+	"graph-sub-pred-obj/version"
 )
 
 // op is one query pattern in the workload mix.
@@ -185,7 +186,13 @@ func main() {
 	clientCount := flag.Int("client-count", 1, "Total number of query load processes")
 	short := flag.Bool("short-queries", true, "Run secondary index queries as short queries (for results under ~100 records); avoids FAIL_FORBIDDEN rejections at high concurrency")
 	jsonOut := flag.Bool("json", false, "Print the summary as JSON")
+	showVersion := flag.Bool("version", false, "Print the build version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("queryload", version.String())
+		return
+	}
 
 	weights, err := parseMix(*mix)
 	if err != nil {
@@ -227,6 +234,7 @@ func main() {
 			fmt.Printf(format, a...)
 		}
 	}
+	logf("queryload %s\n", version.String())
 	logf("Sampled %d triples from partitions %d-%d\n", len(sample), begin, end-1)
 	logf("Running %d workers for %s (target qps: %s, short queries: %t), mix: %s\n\n", *workers, *duration,
 		map[bool]string{true: "unlimited", false: strconv.Itoa(*qps)}[*qps == 0], *short, *mix)

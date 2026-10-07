@@ -104,9 +104,22 @@ go run ./cmd/generate/ \
 | `-client-index` | `0` | This generator's index (0-based) when running on multiple hosts |
 | `-client-count` | `1` | Total number of generators running at the same time |
 | `-rebuild-entities` | off | Rebuild the `entities` set and ID counter from existing triples, then exit |
+| `-version` | off | Print the build version and exit; the version is also printed at startup |
 | `-namespace` | `test` | Aerospike namespace |
 
 Plus the [connection flags](#connecting-to-aerospike).
+
+### Checking Which Build Is Running
+
+When copying binaries to client hosts, confirm they were built from the expected commit:
+
+```bash
+GOOS=linux GOARCH=amd64 go build -o generate.linux ./cmd/generate
+./generate.linux -version
+# generate bec744a (2026-10-07T14:03:13Z) linux/amd64
+```
+
+The version is the git commit the binary was built from, read from the build information Go embeds automatically. A `+modified` suffix means the working tree had changes when it was built, including untracked files. Without running the binary, `strings generate.linux | grep vcs.revision` shows the same commit.
 
 ### What It Generates
 
@@ -226,6 +239,7 @@ total       14398       1434        0      9.1     33.01    140.60    197.73    
 | `-hop-fanout` | `10` | Max second-hop nodes queried per `hop2` |
 | `-client-index`, `-client-count` | `0`, `1` | Split sampling between processes on multiple hosts, as with the generator |
 | `-json` | off | Print the summary as JSON, for collecting results from many hosts |
+| `-version` | off | Print the build version and exit |
 | `-namespace` | `test` | Aerospike namespace |
 
 Plus the [connection flags](#connecting-to-aerospike). To load-test a cluster, run one `queryload` per client host (each with its own `-client-index`) and add up the totals.
@@ -396,6 +410,7 @@ ingest/loader.go     Batch and channel-based streaming ingestion
 cmd/generate/        Content generator: main.go (flags, pipeline), graph.go (triples),
                      pool.go (sharing, rebuild), ids.go (hashing, ID blocks)
 cmd/queryload/       Query load generator: throughput and latency by query pattern
+version/             Build version (git commit) for -version
 viewer/app.py        Interactive web-based graph viewer (Dash + Cytoscape)
 descriptors/         Content type, ontology, and cardinality JSON descriptors
 ```
