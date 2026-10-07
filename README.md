@@ -271,6 +271,7 @@ AEROSPIKE_PASSWORD=... python viewer/app.py \
 
 - **Start Node** search: type 2+ characters to find a node in a sample of the graph (up to 50 matches are shown), or type a full node ID to find any node. Hashed IDs are shown shortened to 20 characters plus `…`
 - **Max Hops** slider (1-6) to control traversal depth
+- **Ontology relationships only** (on by default): navigate entity to entity through the relationships in `descriptors/ontology.json`, regardless of hash type (see below)
 - **Predicate Filter** to show only specific relationship types
 - **Direction** control for outbound, inbound, or bidirectional traversal
 - Changing Max Hops, Predicate Filter, or Direction rebuilds the current graph immediately
@@ -279,6 +280,17 @@ AEROSPIKE_PASSWORD=... python viewer/app.py \
 - **Click** an unexpanded node to expand its relationships inline
 - **Graph stats** panel showing node/edge counts, predicates, type breakdown, and hubs
 - **Color-coded nodes** by type prefix (blue=user, green=post, orange=topic)
+
+### Ontology Navigation
+
+With **Ontology relationships only** checked (the default), the viewer navigates through the relationships defined in `descriptors/ontology.json` (`HAS_ONE_OR_MORE`, `LIVES_AT`, `IS_PART_OF`, `HAS`, `HAS_AN`, `CAN_HAVE_SEVERAL`) between entities such as `INDIVIDUAL:306897` and `ACCOUNT:306991`. Entity IDs and ontology predicates are never hashed, so this works the same with `no-hash`, `sha-256`, or `sha-512` data.
+
+- Traversal and tap-to-expand follow only ontology relationships; identifier nodes and `IS_TYPE` type hubs are left out of the graph
+- The Predicate Filter offers only ontology relationships; selecting none follows all of them
+- Start Node search lists only entities of the ontology's types
+- Clicking an entity lists its identifiers in the info panel as `identifier_type = value` (hashed values shortened), followed by its relationships
+
+Uncheck it to browse every triple, including identifier nodes and `IS_TYPE`. Use `--ontology` to point the viewer at a different ontology descriptor.
 
 ### Hub Limit
 
@@ -317,6 +329,7 @@ Through a link with 80 ms round trips, a 3-hop explore over 2 million triples ta
 | `--alternate-access` | off | Connect via the nodes' `alternate-access-address` |
 | `--listen-port` | `8050` | Port the viewer's web server listens on |
 | `--sample-size` | `100000` | Triples sampled for node search and the predicate filter |
+| `--ontology` | `descriptors/ontology.json` | Ontology descriptor whose relationships drive navigation |
 | `--debug` | off | Enable Dash debug mode with hot reload |
 
 ## Package Structure

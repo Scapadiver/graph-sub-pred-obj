@@ -57,6 +57,21 @@ HASH_DISPLAY_CHARS = 20
 HASH_RE = re.compile(r"[0-9a-f]{64}|[0-9a-f]{128}")
 
 
+DEFAULT_ONTOLOGY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "descriptors", "ontology.json")
+
+
+def load_ontology(path):
+    """Relationship predicates and entity types from the ontology descriptor.
+
+    These are never hashed, so navigating by them works with any hash type.
+    """
+    with open(path) as f:
+        rules = json.load(f)["ontology"]
+    predicates = sorted({r["PRED"] for r in rules})
+    types = sorted({r["SUB"] for r in rules} | {r["OBJ"] for r in rules})
+    return predicates, types
+
+
 def short(value):
     """Shorten hashed content for display; other values are unchanged."""
     if isinstance(value, str) and HASH_RE.fullmatch(value):
@@ -277,7 +292,17 @@ def build_elements(triples):
 # Dash app
 # ---------------------------------------------------------------------------
 
-def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE):
+def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE, ontology_path=DEFAULT_ONTOLOGY):
+    ontology_preds, ontology_types = load_ontology(ontology_path)
+
+    def effective_predicates(pred_filter, ontology_on):
+        """Predicates to traverse: the selected ones, limited to the ontology's
+        relationships (all of them if none selected) when ontology_on."""
+        if ontology_on:
+            chosen = [p for p in (pred_filter or []) if p in ontology_preds]
+            return chosen or ontology_preds
+        return pred_filter or None
+
     app = dash.Dash(__name__)
 
     cyto.load_extra_layouts()
@@ -326,6 +351,12 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE):
                 ),
 
                 html.Label("Predicate Filter", style={"marginTop": "12px"}),
+                dcc.Checklist(
+                    id="ontology-only",
+                    options=[{"label": " Ontology relationships only", "value": "on"}],
+                    value=["on"],
+                    style={"fontSize": "13px", "margin": "4px 0"},
+                ),
                 dcc.Dropdown(
                     id="predicate-filter",
                     options=[],
@@ -482,6 +513,7 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE):
 
         # Hidden stores
         dcc.Store(id="graph-data", data={"elements": [], "expanded": [], "hubs": {}}),
+        dcc.Store(id="sampled-predicates", data=[]),
 
     ], style={"fontFamily": "system-ui, sans-serif", "margin": "0"})
 
@@ -491,7 +523,7 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE):
     node_cache = []
 
     @app.callback(
-        [Output("predicate-filter", "options"),
+        [Output("sampled-predicates", "data"),
          Output("refresh-status", "children")],
         Input("refresh-btn", "n_clicks"),
         running=[(Output("refresh-btn", "disabled"), True, False),
@@ -500,31 +532,46 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE):
     def refresh_dropdowns(n_clicks):
         nodes, predicates = sample_graph(client, namespace, sample_size)
         node_cache[:] = nodes
-        pred_opts = [{"label": short(p), "value": p} for p in predicates]
         status = (f"Sampled {len(nodes):,} nodes, {len(predicates)} predicates. "
                   "Type a full node ID to find any node.")
-        return pred_opts, status
+        return predicates, status
+
+    @app.callback(
+        [Output("predicate-filter", "options"),
+         Output("predicate-filter", "placeholder")],
+        [Input("sampled-predicates", "data"),
+         Input("ontology-only", "value")],
+    )
+    def predicate_options(sampled, ontology_on):
+        if ontology_on:
+            return ([{"label": p, "value": p} for p in ontology_preds],
+                    "All ontology relationships")
+        return [{"label": short(p), "value": p} for p in sampled or []], "All predicates"
 
     @app.callback(
         Output("start-node", "options"),
         Input("start-node", "search_value"),
-        State("start-node", "value"),
+        [State("start-node", "value"),
+         State("ontology-only", "value")],
     )
-    def search_nodes(search, selected):
+    def search_nodes(search, selected, ontology_on):
         if not search or len(search) < MIN_SEARCH_CHARS:
             if selected:
                 return [{"label": short(selected), "value": selected}]
             raise PreventUpdate
+        # In ontology mode, offer only entities of the ontology's types
+        wanted = (lambda n: node_type(n) in ontology_types) if ontology_on else (lambda n: True)
         needle = search.lower()
         matches = []
         for n in node_cache:
-            if needle in n.lower():
+            if needle in n.lower() and wanted(n):
                 matches.append({"label": short(n), "value": n})
                 if len(matches) >= MAX_NODE_OPTIONS:
                     break
         # Nodes outside the sample are found by exact ID
         exact = search.strip()
-        if all(m["value"] != exact for m in matches) and node_exists(client, namespace, exact):
+        if (all(m["value"] != exact for m in matches) and wanted(exact)
+                and node_exists(client, namespace, exact)):
             matches.insert(0, {"label": short(exact), "value": exact})
         return matches
 
@@ -535,14 +582,15 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE):
          Input("graph", "tapNodeData"),
          Input("max-hops", "value"),
          Input("predicate-filter", "value"),
-         Input("direction", "value")],
+         Input("direction", "value"),
+         Input("ontology-only", "value")],
         [State("start-node", "value"),
          State("graph-data", "data"),
          State("graph", "tapNode")],
         prevent_initial_call=True,
     )
     def update_graph_data(explore_clicks, clear_clicks, tap_data,
-                          max_hops, pred_filter, direction,
+                          max_hops, pred_filter, direction, ontology_on,
                           start_node, current_data, tap_node):
         ctx = callback_context
         if not ctx.triggered:
@@ -555,7 +603,7 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE):
 
         # Changing a query control rebuilds the current graph with the new
         # settings; expanding with tap can only add edges, never remove them.
-        if trigger_id in ("max-hops", "predicate-filter", "direction"):
+        if trigger_id in ("max-hops", "predicate-filter", "direction", "ontology-only"):
             if not start_node or not current_data.get("elements"):
                 return current_data
             trigger_id = "explore-btn"
@@ -563,7 +611,7 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE):
         if trigger_id == "explore-btn":
             if not start_node:
                 return current_data
-            preds = pred_filter if pred_filter else None
+            preds = effective_predicates(pred_filter, ontology_on)
             triples, hubs = bfs_expand(client, namespace, start_node, max_hops, preds, direction)
             elements = build_elements(triples)
             return {"elements": elements, "expanded": [start_node], "hubs": hubs}
@@ -577,7 +625,7 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE):
                 return current_data
 
             expanded.append(node_id)
-            preds = pred_filter if pred_filter else None
+            preds = effective_predicates(pred_filter, ontology_on)
             new_triples, truncated = expand_node(client, namespace, node_id, preds, direction)
             hubs = current_data.get("hubs", {})
             if node_id != start_node and len(new_triples) > MAX_EXPAND_DEGREE:
@@ -646,15 +694,25 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE):
             lines = [f"Node: {short(node_id)}", f"Type: {node_type(node_id)}", ""]
             if short(node_id) != node_id:
                 lines.insert(1, f"Full ID: {node_id}")
-            lines.append(f"Outbound edges: {count(outbound)}")
-            for t in outbound[:MAX_INFO_EDGES]:
+            # Identifiers are shown as properties of the entity, by type
+            identifiers = [t for t in outbound if t["predicate"] == "HAS_IDENTIFIER"]
+            relations = [t for t in outbound if t["predicate"] not in ("HAS_IDENTIFIER", "IS_TYPE")]
+            if identifiers:
+                lines.append(f"Identifiers: {len(identifiers)}")
+                for t in sorted(identifiers, key=lambda t: str((t.get("props") or {}).get("identifier_type", ""))):
+                    props = t.get("props") or {}
+                    lines.append(f"  {short(props.get('identifier_type', '?'))} = {short(props.get('value', t['object']))}")
+                lines.append("")
+
+            lines.append(f"Outbound relationships: {count(relations)}")
+            for t in relations[:MAX_INFO_EDGES]:
                 props = t.get("props", {})
                 prop_str = f"  {short_props(props)}" if props else ""
                 lines.append(f"  -[{short(t['predicate'])}]-> {short(t['object'])}{prop_str}")
-            if len(outbound) > MAX_INFO_EDGES:
-                lines.append(f"  ... and {count(outbound, MAX_INFO_EDGES)} more")
+            if len(relations) > MAX_INFO_EDGES:
+                lines.append(f"  ... and {count(relations, MAX_INFO_EDGES)} more")
 
-            lines.append(f"\nInbound edges: {count(inbound)}")
+            lines.append(f"\nInbound relationships: {count(inbound)}")
             for t in inbound[:MAX_INFO_EDGES]:
                 props = t.get("props", {})
                 prop_str = f"  {short_props(props)}" if props else ""
@@ -735,6 +793,8 @@ def main():
     parser.add_argument("--alternate-access", action="store_true",
                         help="Connect via the nodes' alternate-access-address (cloud/NAT/Docker)")
     parser.add_argument("--listen-port", type=int, default=8050, help="Viewer web port (default: 8050)")
+    parser.add_argument("--ontology", default=DEFAULT_ONTOLOGY,
+                        help="Ontology descriptor whose relationships drive navigation (default: descriptors/ontology.json)")
     parser.add_argument("--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE,
                         help=f"Triples sampled for node search and predicates (default: {DEFAULT_SAMPLE_SIZE})")
     parser.add_argument("--debug", action="store_true", help="Enable Dash debug mode")
@@ -748,7 +808,7 @@ def main():
     )
     print(f"Connected to Aerospike at {args.hosts or f'{args.host}:{args.port}'}, namespace={args.namespace}")
 
-    app = create_app(client, namespace, args.sample_size)
+    app = create_app(client, namespace, args.sample_size, args.ontology)
     print(f"Starting viewer at http://127.0.0.1:{args.listen_port}")
     app.run(debug=args.debug, host="0.0.0.0", port=args.listen_port)
 
