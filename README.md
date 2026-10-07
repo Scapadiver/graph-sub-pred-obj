@@ -172,15 +172,15 @@ Types without an entry are never shared. Only `LINKED_TO: "INDIVIDUAL"` is suppo
 
 ### Content Hashing
 
-`-hash-type sha-256` or `-hash-type sha-512` hashes every subject, predicate, object, and string property value (hex-encoded) before it is written; numeric properties such as timestamps and decay are left as-is.
+`-hash-type sha-256` or `-hash-type sha-512` hashes every subject, object, and string property value (hex-encoded) before it is written. Predicates stay readable, and numeric properties such as timestamps and decay are left as-is.
 
 ```
-6a153dffeaf6dfe8… -[e703d71a03e5bc25…]-> 566c4ba49a631c57…
+6a153dffeaf6dfe8… -[HAS_IDENTIFIER]-> 566c4ba49a631c57…
 ```
 
-Hashing is deterministic, so identical content still produces identical nodes and relations form naturally. Sharing and ID resumption work on hashed data by hashing the known vocabulary (type names and predicates) to recognize `IS_TYPE` triples and INDIVIDUAL links. A run only shares with content hashed the same way; mixing hash types in one set produces separate, unconnected graphs.
+Hashing is deterministic, so identical content still produces identical nodes and relations form naturally. Sharing and ID resumption work on hashed data by hashing the known type names to recognize `IS_TYPE` triples. A run only shares with content hashed the same way; mixing hash types in one set produces separate, unconnected graphs. Data generated before predicates were left unhashed has hashed predicates and won't link with newer runs.
 
-In the viewer, hashed nodes have no type prefix, so they all appear in the default color, and the predicate filter lists hashed predicates.
+In the viewer, hashed values are shown as their first 20 characters plus `…` in node labels, search results, the info panel, and edge properties; the info panel also shows the selected node's full ID. Hashed nodes have no type prefix, so they all appear in the default color.
 
 ### Performance
 
@@ -268,7 +268,7 @@ AEROSPIKE_PASSWORD=... python viewer/app.py \
 
 ### Features
 
-- **Start Node** search: type 2+ characters to find a node in a sample of the graph (up to 50 matches are shown), or type a full node ID to find any node
+- **Start Node** search: type 2+ characters to find a node in a sample of the graph (up to 50 matches are shown), or type a full node ID to find any node. Hashed IDs are shown shortened to 20 characters plus `…`
 - **Max Hops** slider (1-6) to control traversal depth
 - **Predicate Filter** to show only specific relationship types
 - **Direction** control for outbound, inbound, or bidirectional traversal

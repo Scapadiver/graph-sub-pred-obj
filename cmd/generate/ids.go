@@ -16,8 +16,9 @@ import (
 // Content hashing
 // ---------------------------------------------------------------------------
 
-// hashContent is applied to every subject, predicate, object and string prop
-// as it is created. Hashing is deterministic, so identical content still links.
+// hashContent is applied to every subject, object and string prop as it is
+// created; predicates stay readable. Hashing is deterministic, so identical
+// content still links.
 var hashContent = func(s string) string { return s }
 
 func newHashFunc(hashType string) (func(string) string, error) {

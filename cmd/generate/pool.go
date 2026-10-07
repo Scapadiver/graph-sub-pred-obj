@@ -187,11 +187,11 @@ func individualPredicates(ontology []OntologyRelation) map[string]bool {
 // tracked entity and to find the highest unhashed ID. Entity types come from
 // IS_TYPE triples, so this works on hashed content of the current hash type.
 func rebuildEntities(scan func(func(*model.Triple) error) error, pool *sharePool, ontology []OntologyRelation) ([]store.EntityLinks, int64, int, error) {
-	isType := hashContent("IS_TYPE")
+	isType := "IS_TYPE"
 	names := pool.typeNames()
 	linkPreds := make(map[string]bool)
 	for p := range individualPredicates(ontology) {
-		linkPreds[hashContent(p)] = true
+		linkPreds[p] = true
 	}
 
 	var maxID int64

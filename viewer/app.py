@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 import aerospike
@@ -49,6 +50,23 @@ QUERY_THREADS = 16
 # Triples sampled for node search and the predicate list, instead of scanning
 # the whole set. Any full node ID can still be found by typing it exactly.
 DEFAULT_SAMPLE_SIZE = 100000
+
+# Hashed content (sha-256 or sha-512 hex) is displayed shortened to this many
+# characters plus an ellipsis; the full value is still used for queries.
+HASH_DISPLAY_CHARS = 20
+HASH_RE = re.compile(r"[0-9a-f]{64}|[0-9a-f]{128}")
+
+
+def short(value):
+    """Shorten hashed content for display; other values are unchanged."""
+    if isinstance(value, str) and HASH_RE.fullmatch(value):
+        return value[:HASH_DISPLAY_CHARS] + "\u2026"
+    return value
+
+
+def short_props(props):
+    """Props with hashed string values shortened, as JSON for display."""
+    return json.dumps({k: short(v) for k, v in props.items()}, default=str, ensure_ascii=False)
 
 
 def parse_hosts(hosts, default_port, tls_name=None):
@@ -234,7 +252,7 @@ def build_elements(triples):
                 nodes[nid] = {
                     "data": {
                         "id": nid,
-                        "label": nid,
+                        "label": short(nid),
                         "type": nt,
                         "color": NODE_COLORS.get(nt, NODE_COLORS["default"]),
                     }
@@ -247,7 +265,7 @@ def build_elements(triples):
                 "id": edge_id,
                 "source": s,
                 "target": o,
-                "label": p,
+                "label": short(p),
                 "props": props_str,
             }
         })
@@ -482,7 +500,7 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE):
     def refresh_dropdowns(n_clicks):
         nodes, predicates = sample_graph(client, namespace, sample_size)
         node_cache[:] = nodes
-        pred_opts = [{"label": p, "value": p} for p in predicates]
+        pred_opts = [{"label": short(p), "value": p} for p in predicates]
         status = (f"Sampled {len(nodes):,} nodes, {len(predicates)} predicates. "
                   "Type a full node ID to find any node.")
         return pred_opts, status
@@ -495,19 +513,19 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE):
     def search_nodes(search, selected):
         if not search or len(search) < MIN_SEARCH_CHARS:
             if selected:
-                return [{"label": selected, "value": selected}]
+                return [{"label": short(selected), "value": selected}]
             raise PreventUpdate
         needle = search.lower()
         matches = []
         for n in node_cache:
             if needle in n.lower():
-                matches.append({"label": n, "value": n})
+                matches.append({"label": short(n), "value": n})
                 if len(matches) >= MAX_NODE_OPTIONS:
                     break
         # Nodes outside the sample are found by exact ID
         exact = search.strip()
         if all(m["value"] != exact for m in matches) and node_exists(client, namespace, exact):
-            matches.insert(0, {"label": exact, "value": exact})
+            matches.insert(0, {"label": short(exact), "value": exact})
         return matches
 
     @app.callback(
@@ -592,7 +610,7 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE):
                 nid = el["data"]["id"]
                 if nid in hubs:
                     el = {
-                        "data": {**el["data"], "label": f"{nid} ({hubs[nid]} edges)"},
+                        "data": {**el["data"], "label": f"{short(nid)} ({hubs[nid]} edges)"},
                         "classes": "hub",
                     }
                 decorated.append(el)
@@ -625,20 +643,22 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE):
             def count(ts, skip=0):
                 return f"{len(ts) - skip}" + ("+" if len(ts) >= HUB_COUNT_CAP else "")
 
-            lines = [f"Node: {node_id}", f"Type: {node_type(node_id)}", ""]
+            lines = [f"Node: {short(node_id)}", f"Type: {node_type(node_id)}", ""]
+            if short(node_id) != node_id:
+                lines.insert(1, f"Full ID: {node_id}")
             lines.append(f"Outbound edges: {count(outbound)}")
             for t in outbound[:MAX_INFO_EDGES]:
                 props = t.get("props", {})
-                prop_str = f"  {json.dumps(props, default=str)}" if props else ""
-                lines.append(f"  -[{t['predicate']}]-> {t['object']}{prop_str}")
+                prop_str = f"  {short_props(props)}" if props else ""
+                lines.append(f"  -[{short(t['predicate'])}]-> {short(t['object'])}{prop_str}")
             if len(outbound) > MAX_INFO_EDGES:
                 lines.append(f"  ... and {count(outbound, MAX_INFO_EDGES)} more")
 
             lines.append(f"\nInbound edges: {count(inbound)}")
             for t in inbound[:MAX_INFO_EDGES]:
                 props = t.get("props", {})
-                prop_str = f"  {json.dumps(props, default=str)}" if props else ""
-                lines.append(f"  {t['subject']} -[{t['predicate']}]->{prop_str}")
+                prop_str = f"  {short_props(props)}" if props else ""
+                lines.append(f"  {short(t['subject'])} -[{short(t['predicate'])}]->{prop_str}")
             if len(inbound) > MAX_INFO_EDGES:
                 lines.append(f"  ... and {count(inbound, MAX_INFO_EDGES)} more")
 
@@ -647,11 +667,11 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE):
         if "tapEdgeData" in trigger and edge_data:
             lines = [
                 f"Edge: {edge_data.get('label', '')}",
-                f"Source: {edge_data.get('source', '')}",
-                f"Target: {edge_data.get('target', '')}",
+                f"Source: {short(edge_data.get('source', ''))}",
+                f"Target: {short(edge_data.get('target', ''))}",
                 "",
                 "Properties:",
-                edge_data.get("props", "{}"),
+                short_props(json.loads(edge_data.get("props", "{}"))),
             ]
             return "\n".join(lines)
 
@@ -684,7 +704,7 @@ def create_app(client, namespace, sample_size=DEFAULT_SAMPLE_SIZE):
             lines.append(html.Div(f"Hubs not expanded (> {MAX_EXPAND_DEGREE} edges):",
                                   style={"marginTop": "8px"}))
             for nid, degree in sorted(hubs.items(), key=lambda h: -int(h[1].rstrip("+"))):
-                lines.append(html.Div(f"  {nid}: {degree} edges",
+                lines.append(html.Div(f"  {short(nid)}: {degree} edges",
                                       style={"color": "#D84315", "paddingLeft": "8px"}))
         lines.append(html.Hr())
         for nt, count in sorted(node_types.items()):
